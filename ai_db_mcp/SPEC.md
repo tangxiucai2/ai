@@ -23,7 +23,14 @@
 
 ### 3.1 Core Features
 
-#### 3.1.1 Database Connection Management
+#### 3.1.1 SSH Connection Management
+- Establish SSH connections to remote hosts
+- Support password-based and key-based authentication
+- Connection pooling using ConcurrentHashMap for efficient resource usage
+- Graceful connection cleanup on shutdown
+- Support for long-running commands with continuous output streaming
+
+#### 3.1.2 Database Connection Management
 - Load and initialize the custom `aisDriver-1.0-SNAPSHOT.jar`
 - Support connection configuration via connection string
 - Connection pooling using ConcurrentHashMap for efficient resource usage
@@ -105,6 +112,28 @@
 **Tool Name:** `list_connections`
 - Output: List of active connection IDs
 
+#### 3.1.5 SSH Tools
+
+**Tool Name:** `ssh_connect`
+- Input: `host`, `port`, `username`, `password`, `privateKey`, `passphrase`
+- Output: Connection ID for subsequent operations
+- Supports password-based and key-based authentication
+
+**Tool Name:** `ssh_disconnect`
+- Input: `connectionId`
+- Output: Success/failure status
+
+**Tool Name:** `ssh_list_connections`
+- Output: Count of active SSH connections
+
+**Tool Name:** `ssh_execute`
+- Input: `connectionId`, `command`
+- Output: Exit code, output, and error output (if any)
+
+**Tool Name:** `ssh_execute_long_running`
+- Input: `connectionId`, `command`, `timeout`
+- Output: Exit code, output, and error output with support for continuous output streaming
+
 ---
 
 ### 3.2 MCP Protocol Implementation
@@ -115,7 +144,7 @@
 - **Message Format:** JSON-RPC 2.0
 
 #### 3.2.2 Server Capabilities
-- Tools: `execute`, `execute_transaction`, `create_connection`, `close_connection`, `list_connections`
+- Tools: `execute`, `execute_transaction`, `create_connection`, `close_connection`, `list_connections`, `ssh_connect`, `ssh_disconnect`, `ssh_list_connections`, `ssh_execute`, `ssh_execute_long_running`
 - No resources (initially)
 - No prompts (initially)
 
@@ -301,6 +330,86 @@ logging:
       "sqlList": {"type": "array", "items": {"type": "string"}, "description": "List of SQL statements"}
     },
     "required": ["connectionId", "sqlList"]
+  }
+}
+```
+
+### 7.6 ssh_connect
+```json
+{
+  "name": "ssh_connect",
+  "description": "Create a new SSH connection to a remote host",
+  "inputSchema": {
+    "type": "object",
+    "properties": {
+      "host": {"type": "string", "description": "Remote host address"},
+      "port": {"type": "integer", "description": "SSH port (default: 22)"},
+      "username": {"type": "string", "description": "Username for authentication"},
+      "password": {"type": "string", "description": "Password for password-based authentication"},
+      "privateKey": {"type": "string", "description": "Private key content for key-based authentication"},
+      "passphrase": {"type": "string", "description": "Passphrase for encrypted private key"}
+    },
+    "required": ["host", "username"]
+  }
+}
+```
+
+### 7.7 ssh_disconnect
+```json
+{
+  "name": "ssh_disconnect",
+  "description": "Close an existing SSH connection",
+  "inputSchema": {
+    "type": "object",
+    "properties": {
+      "connectionId": {"type": "string", "description": "Connection ID to close"}
+    },
+    "required": ["connectionId"]
+  }
+}
+```
+
+### 7.8 ssh_list_connections
+```json
+{
+  "name": "ssh_list_connections",
+  "description": "List all active SSH connections",
+  "inputSchema": {
+    "type": "object",
+    "properties": {}
+  }
+}
+```
+
+### 7.9 ssh_execute
+```json
+{
+  "name": "ssh_execute",
+  "description": "Execute a command on the remote host (supports continuous output)",
+  "inputSchema": {
+    "type": "object",
+    "properties": {
+      "connectionId": {"type": "string", "description": "Connection ID"},
+      "command": {"type": "string", "description": "Command to execute"}
+    },
+    "required": ["connectionId", "command"]
+  }
+}
+```
+
+### 7.10 ssh_execute_long_running
+```json
+{
+  "name": "ssh_execute_long_running",
+  "description": "Execute a long-running command with continuous output streaming",
+  "inputSchema": {
+    "type": "object",
+    "properties": {
+      "connectionId": {"type": "string", "description": "Connection ID"},
+      "command": {"type": "string", "description": "Command to execute"},
+      "timeout": {"type": "integer", "description": "Timeout in milliseconds (0 for no timeout)"}
+    },
+    "required": ["connectionId", "command"]
   }
 }
 ```

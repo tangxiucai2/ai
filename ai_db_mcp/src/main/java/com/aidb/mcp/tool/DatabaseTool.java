@@ -12,6 +12,8 @@ import java.util.Map;
 import java.util.UUID;
 import java.util.concurrent.ConcurrentHashMap;
 
+import com.aidb.mcp.config.McpRequestFilter;
+import org.springaicommunity.mcp.annotation.McpMeta;
 import org.springaicommunity.mcp.annotation.McpTool;
 import org.springaicommunity.mcp.annotation.McpToolParam;
 import org.springframework.stereotype.Component;
@@ -25,12 +27,23 @@ public class DatabaseTool {
     public Map<String, Object> create_connection(
             @McpToolParam(description = "Database connection string") String connectionString,
             @McpToolParam(description = "Database username") String username,
-            @McpToolParam(description = "Database password") String password) {
+            @McpToolParam(description = "Database password") String password,
+            McpMeta meta) {
         Map<String, Object> result = new HashMap<>();
         
         try {
+            String connStr = getConnectionString(connectionString, meta);
+            String user = getUsername(username, meta);
+            String pwd = getPassword(password, meta);
+            
+            if (connStr == null || connStr.isEmpty()) {
+                result.put("success", false);
+                result.put("error", "Connection string is required");
+                return result;
+            }
+            
             String connectionId = UUID.randomUUID().toString();
-            Connection conn = java.sql.DriverManager.getConnection(connectionString, username, password);
+            Connection conn = java.sql.DriverManager.getConnection(connStr, user, pwd);
             connections.put(connectionId, conn);
             
             result.put("success", true);
@@ -43,6 +56,39 @@ public class DatabaseTool {
         }
         
         return result;
+    }
+
+    private String getConnectionString(String paramValue, McpMeta meta) {
+        if (paramValue != null && !paramValue.isEmpty()) {
+            return paramValue;
+        }
+        Object metaValue = meta.get("connectionString");
+        if (metaValue != null && !((String) metaValue).isEmpty()) {
+            return (String) metaValue;
+        }
+        return McpRequestFilter.getConnectionStringFromHeader();
+    }
+
+    private String getUsername(String paramValue, McpMeta meta) {
+        if (paramValue != null && !paramValue.isEmpty()) {
+            return paramValue;
+        }
+        Object metaValue = meta.get("username");
+        if (metaValue != null && !((String) metaValue).isEmpty()) {
+            return (String) metaValue;
+        }
+        return McpRequestFilter.getUsernameFromHeader();
+    }
+
+    private String getPassword(String paramValue, McpMeta meta) {
+        if (paramValue != null && !paramValue.isEmpty()) {
+            return paramValue;
+        }
+        Object metaValue = meta.get("password");
+        if (metaValue != null && !((String) metaValue).isEmpty()) {
+            return (String) metaValue;
+        }
+        return McpRequestFilter.getPasswordFromHeader();
     }
 
     @McpTool(name = "close_connection", description = "Close an existing database connection")
