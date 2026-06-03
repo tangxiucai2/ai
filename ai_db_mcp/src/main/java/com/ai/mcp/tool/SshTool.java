@@ -1,4 +1,4 @@
-package com.aidb.mcp.tool;
+package com.ai.mcp.tool;
 
 import com.jcraft.jsch.*;
 import org.springaicommunity.mcp.annotation.McpTool;

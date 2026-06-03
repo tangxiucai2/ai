@@ -1,4 +1,4 @@
-package com.aidb.mcp.tool;
+package com.ai.mcp.tool;
 
 import java.sql.Connection;
 import java.sql.PreparedStatement;
@@ -12,19 +12,20 @@ import java.util.Map;
 import java.util.UUID;
 import java.util.concurrent.ConcurrentHashMap;
 
-import com.aidb.mcp.config.McpRequestFilter;
 import org.springaicommunity.mcp.annotation.McpMeta;
 import org.springaicommunity.mcp.annotation.McpTool;
 import org.springaicommunity.mcp.annotation.McpToolParam;
 import org.springframework.stereotype.Component;
+
+import com.ai.mcp.config.McpRequestFilter;
 
 @Component
 public class DatabaseTool {
 
     private final Map<String, Connection> connections = new ConcurrentHashMap<>();
 
-    @McpTool(name = "create_connection", description = "Create a new database connection")
-    public Map<String, Object> create_connection(
+    @McpTool(name = "db_create_connection", description = "Create a new database connection")
+    public Map<String, Object> db_create_connection(
             @McpToolParam(description = "Database connection string") String connectionString,
             @McpToolParam(description = "Database username") String username,
             @McpToolParam(description = "Database password") String password,
@@ -91,8 +92,8 @@ public class DatabaseTool {
         return McpRequestFilter.getPasswordFromHeader();
     }
 
-    @McpTool(name = "close_connection", description = "Close an existing database connection")
-    public Map<String, Object> close_connection(
+    @McpTool(name = "db_close_connection", description = "Close an existing database connection")
+    public Map<String, Object> db_close_connection(
             @McpToolParam(description = "Connection ID to close") String connectionId) {
         Map<String, Object> result = new HashMap<>();
         
@@ -114,8 +115,8 @@ public class DatabaseTool {
         return result;
     }
 
-    @McpTool(name = "list_connections", description = "List all valid database connections")
-    public Map<String, Object> list_connections() {
+    @McpTool(name = "db_list_connections", description = "List all valid database connections")
+    public Map<String, Object> db_list_connections() {
         Map<String, Object> result = new HashMap<>();
         List<String> validConnections = new ArrayList<>();
         List<String> invalidConnections = new ArrayList<>();
@@ -146,8 +147,8 @@ public class DatabaseTool {
         return result;
     }
 
-    @McpTool(name = "execute", description = "Execute a SQL query or update statement")
-    public Map<String, Object> execute(
+    @McpTool(name = "db_execute", description = "Execute a SQL query or update statement")
+    public Map<String, Object> db_execute(
             @McpToolParam(description = "Connection ID") String connectionId,
             @McpToolParam(description = "SQL statement to execute") String sql) {
         Map<String, Object> result = new HashMap<>();
@@ -176,8 +177,8 @@ public class DatabaseTool {
         }
     }
 
-    @McpTool(name = "execute_transaction", description = "Execute multiple SQL statements in a transaction")
-    public Map<String, Object> execute_transaction(
+    @McpTool(name = "db_execute_transaction", description = "Execute multiple SQL statements in a transaction")
+    public Map<String, Object> db_execute_transaction(
             @McpToolParam(description = "Connection ID") String connectionId,
             @McpToolParam(description = "List of SQL statements") List<String> sqlList) {
         Map<String, Object> result = new HashMap<>();

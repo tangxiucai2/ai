@@ -4,13 +4,13 @@
          xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 http://maven.apache.org/xsd/maven-4.0.0.xsd">
     <modelVersion>4.0.0</modelVersion>
 
-    <groupId>com.aidb</groupId>
-    <artifactId>ai_db_mcp</artifactId>
+    <groupId>com.ai</groupId>
+    <artifactId>ai_mcp</artifactId>
     <version>1.0.0-SNAPSHOT</version>
     <packaging>jar</packaging>
 
-    <name>ai_db_mcp</name>
-    <description>Java MCP Server for Database Access using Spring AI</description>
+    <name>ai_mcp</name>
+    <description>Java MCP Server providing database access and SSH capabilities using Spring AI</description>
 
     <parent>
         <groupId>org.springframework.boot</groupId>
@@ -95,7 +95,7 @@
                 <groupId>org.springframework.boot</groupId>
                 <artifactId>spring-boot-maven-plugin</artifactId>
                 <configuration>
-                    <mainClass>com.aidb.mcp.AiDbMcpApplication</mainClass>
+                    <mainClass>com.ai.mcp.AiMcpApplication</mainClass>
                     <includeSystemScope>true</includeSystemScope>
                 </configuration>
             </plugin>

@@ -1,11 +1,11 @@
-# AI DB MCP Service Specification
+# AI MCP Service Specification
 
 ## 1. Project Overview
 
-**Project Name:** ai_db_mcp  
+**Project Name:** ai_mcp  
 **Project Type:** Java MCP (Model Context Protocol) Server based on Spring AI  
-**Core Functionality:** A Spring AI-based MCP server that provides database access interfaces to AI models/clients, internally using a custom driver (`aisDriver-1.0-SNAPSHOT.jar`) for multi-database connectivity.  
-**Target Users:** AI agents, LLM applications, and any MCP-compatible clients requiring database access.
+**Core Functionality:** A Spring AI-based MCP server that provides database access and SSH connectivity interfaces to AI models/clients.  
+**Target Users:** AI agents, LLM applications, and any MCP-compatible clients requiring database or SSH access.
 
 ---
 
@@ -430,7 +430,7 @@ java -jar target/ai_db_mcp-1.0.0-SNAPSHOT.jar
 
 ### 8.3 Run (Debug Mode)
 ```bash
-java -agentlib:jdwp=transport=dt_socket,server=y,suspend=n,address=5005 -jar target/ai_db_mcp-1.0.0-SNAPSHOT.jar
+java -agentlib:jdwp=transport=dt_socket,server=y,suspend=n,address=5005 -jar target/ai_mcp-1.0.0-SNAPSHOT.jar
 ```
 
 ### 8.4 MCP Inspector Connection

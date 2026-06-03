@@ -3,15 +3,17 @@ server:
 
 spring:
   application:
-    name: ai_db_mcp
+    name: ai_mcp
   ai:
     mcp:
       server:
         protocol: STATELESS
+        name: AI MCP Server
+        instructions: "提供数据库连接管理和远程主机SSH连接功能。支持创建和管理数据库连接、执行SQL语句、事务处理，以及SSH连接到远程主机执行命令。"
         annotation-scanner:
           enabled: true
           base-packages:
-            - com.aidb.mcp
+            - com.ai.mcp
         capabilities:
           tool: true
 

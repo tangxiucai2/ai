@@ -1,12 +1,12 @@
-package com.aidb.mcp;
+package com.ai.mcp;
 
 import org.springframework.boot.SpringApplication;
 import org.springframework.boot.autoconfigure.SpringBootApplication;
 
 @SpringBootApplication
-public class AiDbMcpApplication {
+public class AiMcpApplication {
 
     public static void main(String[] args) {
-        SpringApplication.run(AiDbMcpApplication.class, args);
+        SpringApplication.run(AiMcpApplication.class, args);
     }
 }
