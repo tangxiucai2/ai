@@ -24,6 +24,7 @@ import java.time.LocalDate;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.HexFormat;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
@@ -67,6 +68,30 @@ public class ConsoleClient {
     private volatile String authType;
     private volatile String authToken;
     private volatile long consoleRttMs;
+
+    // 身份解析缓存 key = agentCode\ntoken\nuserName; 访问序 LinkedHashMap, 超 1000 条淘汰最久未用; 拒绝不缓存
+    private static final int RESOLVE_CACHE_MAX = 1000;
+    private final LinkedHashMap<String, CachedResolved> resolveCache = new LinkedHashMap<>(64, 0.75f, true) {
+        @Override
+        protected boolean removeEldestEntry(Map.Entry<String, CachedResolved> eldest) {
+            return size() > RESOLVE_CACHE_MAX;
+        }
+    };
+
+    /** 控制台解析出的连接信息 + 真实凭据 (只在内存, 不落盘不打日志) */
+    public record Resolved(long agentId, long credentialId, String category, String dbType, String address,
+                           Integer port, String dbName, String username, String password) {
+    }
+
+    private record CachedResolved(Resolved value, long expireAt) {
+    }
+
+    /** 控制台明确拒绝 (code=403 + 中文原因) */
+    public static class Rejected extends RuntimeException {
+        public Rejected(String msg) {
+            super(msg);
+        }
+    }
 
     // 指标
     private final AtomicInteger inflight = new AtomicInteger();
@@ -181,15 +206,8 @@ public class ConsoleClient {
                 "consoleRttMs", consoleRttMs,
                 "inflight", inflight.get(),
                 "todayRequests", todayRequests());
-        String ts = String.valueOf(System.currentTimeMillis());
         long t0 = System.currentTimeMillis();
-        Map<String, Object> resp = http.post().uri(consoleUrl + "/agent/gateway/opt/report")
-                .contentType(MediaType.APPLICATION_JSON)
-                .header("X-Worker-Id", nodeId)
-                .header("X-Timestamp", ts)
-                .header("X-Sign", hmac(secret, nodeId + "\n" + ts))
-                .body(body)
-                .retrieve().body(Map.class);
+        Map<String, Object> resp = signedPost("/agent/gateway/opt/report", body);
         consoleRttMs = System.currentTimeMillis() - t0;
         if (!isOk(resp)) {
             // 403: 节点被禁用/密钥被重置/已删除 → fail-closed
@@ -213,6 +231,68 @@ public class ConsoleClient {
 
     private static boolean isOk(Map<String, Object> resp) {
         return resp != null && Integer.valueOf(200).equals(resp.get("code")) && resp.get("data") != null;
+    }
+
+    @SuppressWarnings("unchecked")
+    private Map<String, Object> signedPost(String path, Map<String, Object> body) throws Exception {
+        String ts = String.valueOf(System.currentTimeMillis());
+        return http.post().uri(consoleUrl + path)
+                .contentType(MediaType.APPLICATION_JSON)
+                .header("X-Worker-Id", nodeId)
+                .header("X-Timestamp", ts)
+                .header("X-Sign", hmac(secret, nodeId + "\n" + ts))
+                .body(body)
+                .retrieve().body(Map.class);
+    }
+
+    /**
+     * 虚拟凭据 → 真实连接信息: 缓存命中直接返回, 未命中调控制台 opt/resolve (ttl 由控制台下发)
+     *
+     * @throws Rejected  控制台拒绝 (原因为中文, 直接回给客户端)
+     * @throws Exception 控制台不可达
+     */
+    @SuppressWarnings("unchecked")
+    public Resolved resolve(String agentCode, String token, String userName) throws Exception {
+        String key = agentCode + "\n" + token + "\n" + (userName == null ? "" : userName);
+        long now = System.currentTimeMillis();
+        synchronized (resolveCache) {
+            CachedResolved hit = resolveCache.get(key);
+            if (hit != null && hit.expireAt() > now) {
+                return hit.value();
+            }
+        }
+        Map<String, Object> body = new java.util.HashMap<>();
+        body.put("agentCode", agentCode);
+        body.put("token", token);
+        if (userName != null) {
+            body.put("userName", userName);
+        }
+        Map<String, Object> resp = signedPost("/agent/gateway/opt/resolve", body);
+        if (!isOk(resp)) {
+            // 仅 400/401/403 是控制台明确拒绝 (回 403); 500/空响应属控制台故障, 抛出走 503
+            int code = resp != null && resp.get("code") instanceof Number ? ((Number) resp.get("code")).intValue() : -1;
+            if (code == 400 || code == 401 || code == 403) {
+                Object msg = resp.get("msg");
+                throw new Rejected(msg == null ? "控制台拒绝" : msg.toString());
+            }
+            throw new IllegalStateException("控制台响应异常 code=" + code);
+        }
+        Map<String, Object> d = (Map<String, Object>) resp.get("data");
+        Resolved r = new Resolved(
+                ((Number) d.get("agentId")).longValue(),
+                ((Number) d.get("credentialId")).longValue(),
+                (String) d.get("category"),
+                (String) d.get("dbType"),
+                (String) d.get("address"),
+                d.get("port") == null ? null : ((Number) d.get("port")).intValue(),
+                (String) d.get("dbName"),
+                (String) d.get("username"),
+                (String) d.get("password"));
+        long ttl = d.get("ttlSeconds") == null ? 60 : ((Number) d.get("ttlSeconds")).longValue();
+        synchronized (resolveCache) {
+            resolveCache.put(key, new CachedResolved(r, now + ttl * 1000));
+        }
+        return r;
     }
 
     // -------------------- 供 Filter 调用 --------------------

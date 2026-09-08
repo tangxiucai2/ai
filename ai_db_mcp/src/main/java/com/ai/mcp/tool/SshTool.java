@@ -1,6 +1,9 @@
 package com.ai.mcp.tool;
 
+import com.ai.mcp.config.ConsoleClient;
+import com.ai.mcp.config.McpRequestFilter;
 import com.jcraft.jsch.*;
+import io.modelcontextprotocol.common.McpTransportContext;
 import org.springaicommunity.mcp.annotation.McpTool;
 import org.springaicommunity.mcp.annotation.McpToolParam;
 import org.springframework.stereotype.Component;
@@ -19,61 +22,31 @@ import java.util.concurrent.ConcurrentHashMap;
 public class SshTool {
 
     private final Map<String, Session> sessions = new ConcurrentHashMap<>();
+    private final IdleReaper<Session> reaper = new IdleReaper<>("ssh-idle-reaper", sessions, Session::disconnect);
     private final Map<String, ChannelExec> activeChannels = new ConcurrentHashMap<>();
 
-    @McpTool(name = "ssh_connect", description = "Create a new SSH connection to a remote host. Either password or privateKey must be provided, not both.")
-    public Map<String, Object> ssh_connect(
-            @McpToolParam(description = "Remote host address") String host,
-            @McpToolParam(description = "SSH port (default: 22)") Integer port,
-            @McpToolParam(description = "Username for authentication") String username,
-            @McpToolParam(description = "Password for password-based authentication") String password,
-            @McpToolParam(description = "Private key content for key-based authentication") String privateKey,
-            @McpToolParam(description = "Passphrase for encrypted private key") String passphrase) {
-        
+    @McpTool(name = "ssh_connect", description = "Create a new SSH connection using the credential bound to this request (no parameters needed)")
+    public Map<String, Object> ssh_connect(McpTransportContext ctx) {
         Map<String, Object> result = new HashMap<>();
-        
-        if (host == null || host.isEmpty()) {
+        ConsoleClient.Resolved cred = McpRequestFilter.credential(ctx);
+        if (cred == null || !"HOST".equals(cred.category())) {
             result.put("success", false);
-            result.put("error", "Host is required");
+            result.put("error", "当前虚拟凭据不是主机资源");
             return result;
         }
-        
-        if (username == null || username.isEmpty()) {
-            result.put("success", false);
-            result.put("error", "Username is required");
-            return result;
-        }
-        
-        boolean hasPassword = password != null && !password.isEmpty();
-        boolean hasPrivateKey = privateKey != null && !privateKey.isEmpty();
-        
-        if (!hasPassword && !hasPrivateKey) {
-            result.put("success", false);
-            result.put("error", "Either password or privateKey must be provided");
-            return result;
-        }
-        
-        if (hasPassword && hasPrivateKey) {
-            result.put("success", false);
-            result.put("error", "Cannot use both password and privateKey authentication at the same time");
-            return result;
-        }
+        String host = cred.address();
+        Integer port = cred.port();
+        String username = cred.username();
+        String password = cred.password();
         
         JSch jsch = new JSch();
         Session session = null;
         
         try {
-            if (hasPrivateKey) {
-                jsch.addIdentity("mcp-ssh-key", privateKey.getBytes(), null, 
-                    passphrase != null ? passphrase.getBytes() : null);
-            }
-            
             int sshPort = port != null ? port : 22;
             session = jsch.getSession(username, host, sshPort);
             
-            if (hasPassword) {
-                session.setPassword(password);
-            }
+            session.setPassword(password);
             
             session.setConfig("StrictHostKeyChecking", "no");
             session.setConfig("PreferredAuthentications", "password");
@@ -87,15 +60,17 @@ public class SshTool {
                 return result;
             }
             
-            String connectionId = UUID.randomUUID().toString();
+            // 句柄按凭据隔离: credentialId 前缀
+            String connectionId = cred.credentialId() + ":" + UUID.randomUUID();
             sessions.put(connectionId, session);
+            reaper.touch(connectionId);
             
             result.put("success", true);
             result.put("connectionId", connectionId);
             result.put("host", host);
             result.put("port", sshPort);
             result.put("username", username);
-            result.put("authType", hasPassword ? "password" : "privateKey");
+            result.put("authType", "password");
             result.put("message", "SSH connection established successfully");
             
         } catch (JSchException e) {
@@ -129,18 +104,27 @@ public class SshTool {
         return result;
     }
 
+    /** 只允许操作当前请求凭据前缀下的句柄 */
+    private Session lookup(String connectionId, McpTransportContext ctx) {
+        ConsoleClient.Resolved cred = McpRequestFilter.credential(ctx);
+        if (cred == null || connectionId == null || !connectionId.startsWith(cred.credentialId() + ":")) {
+            return null;
+        }
+        return reaper.acquire(connectionId);
+    }
+
     @McpTool(name = "ssh_disconnect", description = "Close an existing SSH connection")
     public Map<String, Object> ssh_disconnect(
-            @McpToolParam(description = "Connection ID to close") String connectionId) {
+            @McpToolParam(description = "Connection ID to close") String connectionId, McpTransportContext ctx) {
         
         Map<String, Object> result = new HashMap<>();
         
-        ChannelExec channel = activeChannels.remove(connectionId);
+        Session session = lookup(connectionId, ctx) == null ? null : sessions.remove(connectionId);
+        ChannelExec channel = session == null ? null : activeChannels.remove(connectionId);
         if (channel != null && channel.isConnected()) {
             channel.disconnect();
         }
-        
-        Session session = sessions.remove(connectionId);
+
         if (session != null) {
             if (session.isConnected()) {
                 session.disconnect();
@@ -157,7 +141,9 @@ public class SshTool {
     }
 
     @McpTool(name = "ssh_list_connections", description = "List all active SSH connections")
-    public Map<String, Object> ssh_list_connections() {
+    public Map<String, Object> ssh_list_connections(McpTransportContext ctx) {
+        ConsoleClient.Resolved cred = McpRequestFilter.credential(ctx);
+        String prefix = cred == null ? null : cred.credentialId() + ":";
         Map<String, Object> result = new HashMap<>();
         
         List<String> validConnections = new ArrayList<>();
@@ -165,6 +151,9 @@ public class SshTool {
 
         for (Map.Entry<String, Session> entry : sessions.entrySet()) {
             String connectionId = entry.getKey();
+            if (prefix == null || !connectionId.startsWith(prefix)) {
+                continue;
+            }
             Session session = entry.getValue();
             try {
                 if (session.isConnected()) {
@@ -194,11 +183,11 @@ public class SshTool {
     @McpTool(name = "ssh_execute", description = "Execute a command on the remote host (supports continuous output)")
     public Map<String, Object> ssh_execute(
             @McpToolParam(description = "Connection ID") String connectionId,
-            @McpToolParam(description = "Command to execute") String command) {
+            @McpToolParam(description = "Command to execute") String command, McpTransportContext ctx) {
         
         Map<String, Object> result = new HashMap<>();
         
-        Session session = sessions.get(connectionId);
+        Session session = lookup(connectionId, ctx);
         if (session == null) {
             result.put("success", false);
             result.put("error", "Connection not found: " + connectionId);
@@ -304,11 +293,11 @@ public class SshTool {
     public Map<String, Object> ssh_execute_long_running(
             @McpToolParam(description = "Connection ID") String connectionId,
             @McpToolParam(description = "Command to execute") String command,
-            @McpToolParam(description = "Timeout in milliseconds (0 for no timeout)") Long timeout) {
+            @McpToolParam(description = "Timeout in milliseconds (0 for no timeout)") Long timeout, McpTransportContext ctx) {
         
         Map<String, Object> result = new HashMap<>();
         
-        Session session = sessions.get(connectionId);
+        Session session = lookup(connectionId, ctx);
         if (session == null) {
             result.put("success", false);
             result.put("error", "Connection not found: " + connectionId);

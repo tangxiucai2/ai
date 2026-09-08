@@ -1,14 +1,30 @@
 package com.ai.mcp.config;
 
+import com.ai.mcp.tool.IdleReaper;
+
+import io.modelcontextprotocol.common.McpTransportContext;
 import jakarta.servlet.*;
 import jakarta.servlet.http.HttpServletRequest;
 import jakarta.servlet.http.HttpServletResponse;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 import org.springframework.web.util.UrlPathHelper;
-import java.io.IOException;
 
+import java.io.IOException;
+import java.nio.charset.StandardCharsets;
+
+/**
+ * /mcp 鉴权: 节点级 (503/401) → 智能体身份链 (缺头 401 / 控制台拒绝 403 / 控制台不可达 503)
+ * <p>
+ * 解析结果放 request attribute, 由 McpTransportConfig 的 contextExtractor 带进 McpTransportContext;
+ * 工具方法在 Reactor boundedElastic 线程执行, ThreadLocal 到不了
+ */
 public class McpRequestFilter implements Filter {
 
-    private static final ThreadLocal<HttpServletRequest> currentRequest = new ThreadLocal<>();
+    private static final Logger log = LoggerFactory.getLogger(McpRequestFilter.class);
+
+    /** request attribute / McpTransportContext 键 */
+    public static final String CREDENTIAL = "soag.credential";
 
     private final ConsoleClient console;
     // 与传输层共用端点配置, 避免改了 mcp-endpoint 后鉴权仍只盯 /mcp
@@ -37,45 +53,66 @@ public class McpRequestFilter implements Filter {
         HttpServletResponse resp = (HttpServletResponse) response;
         // fail-closed: 控制台未确认启用 (未注册/被禁用/密钥重置/已删除) 一律 503
         if (!console.isEnabled()) {
-            resp.sendError(HttpServletResponse.SC_SERVICE_UNAVAILABLE, "节点未启用");
+            reject(resp, HttpServletResponse.SC_SERVICE_UNAVAILABLE, "节点未启用");
             return;
         }
         Object certs = req.getAttribute("jakarta.servlet.request.X509Certificate");
         boolean clientCertVerified = certs instanceof Object[] arr && arr.length > 0;
         if (!console.checkToken(req.getHeader("Authorization"), clientCertVerified)) {
             resp.setHeader("WWW-Authenticate", "Bearer");
-            resp.sendError(HttpServletResponse.SC_UNAUTHORIZED, "Token 校验失败");
+            reject(resp, HttpServletResponse.SC_UNAUTHORIZED, "Token 校验失败");
             return;
         }
+        // 智能体身份: Header 优先, Query 兜底 (客户端不支持自定义头的场景)
+        String agentCode = param(req, "X-Agent-Id", "agentId");
+        String token = param(req, "X-Virtual-Token", "token");
+        String userName = param(req, "X-User-Name", "userName");
+        if (agentCode == null || token == null) {
+            reject(resp, HttpServletResponse.SC_UNAUTHORIZED, "缺少智能体标识或虚拟凭据");
+            return;
+        }
+        ConsoleClient.Resolved credential;
+        try {
+            credential = console.resolve(agentCode, token, userName);
+        } catch (ConsoleClient.Rejected e) {
+            reject(resp, HttpServletResponse.SC_FORBIDDEN, e.getMessage());
+            return;
+        } catch (Exception e) {
+            log.warn("resolve 控制台不可达 agent={}: {}", agentCode, e.toString());
+            reject(resp, HttpServletResponse.SC_SERVICE_UNAVAILABLE, "控制台不可达");
+            return;
+        }
+        req.setAttribute(CREDENTIAL, credential);
         long t0 = System.currentTimeMillis();
         console.requestBegin();
-        currentRequest.set(req);
+        // 在途计数: 该凭据的句柄在请求期间不被空闲回收
+        IdleReaper.begin(credential.credentialId());
         try {
             chain.doFilter(request, response);
         } finally {
-            currentRequest.remove();
+            IdleReaper.end(credential.credentialId());
             console.requestEnd(System.currentTimeMillis() - t0);
         }
     }
 
-    public static HttpServletRequest getCurrentRequest() {
-        return currentRequest.get();
+    private static String param(HttpServletRequest req, String header, String query) {
+        String v = req.getHeader(header);
+        if (v == null || v.isBlank()) {
+            v = req.getParameter(query);
+        }
+        return v == null || v.isBlank() ? null : v.trim();
     }
 
-    public static String getHeader(String name) {
-        HttpServletRequest req = currentRequest.get();
-        return req != null ? req.getHeader(name) : null;
+    /** sendError 的文案会被 Boot 默认错误页丢掉, 直接写 JSON 让客户端/控制台连接测试拿到原因 */
+    private static void reject(HttpServletResponse resp, int status, String msg) throws IOException {
+        resp.setStatus(status);
+        resp.setContentType("application/json;charset=UTF-8");
+        String json = "{\"code\":" + status + ",\"msg\":\"" + msg.replace("\\", "\\\\").replace("\"", "\\\"") + "\"}";
+        resp.getOutputStream().write(json.getBytes(StandardCharsets.UTF_8));
     }
 
-    public static String getConnectionStringFromHeader() {
-        return getHeader("X-AIDB-CONNECTION-STRING");
-    }
-
-    public static String getUsernameFromHeader() {
-        return getHeader("X-AIDB-USERNAME");
-    }
-
-    public static String getPasswordFromHeader() {
-        return getHeader("X-AIDB-PASSWORD");
+    /** 工具方法从 McpTransportContext 取当前请求凭据 */
+    public static ConsoleClient.Resolved credential(McpTransportContext ctx) {
+        return ctx == null ? null : (ConsoleClient.Resolved) ctx.get(CREDENTIAL);
     }
 }

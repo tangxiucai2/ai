@@ -12,92 +12,88 @@ import java.util.Map;
 import java.util.UUID;
 import java.util.concurrent.ConcurrentHashMap;
 
-import org.springaicommunity.mcp.annotation.McpMeta;
+import io.modelcontextprotocol.common.McpTransportContext;
 import org.springaicommunity.mcp.annotation.McpTool;
 import org.springaicommunity.mcp.annotation.McpToolParam;
 import org.springframework.stereotype.Component;
 
+import com.ai.mcp.config.ConsoleClient;
 import com.ai.mcp.config.McpRequestFilter;
 
 @Component
 public class DatabaseTool {
 
     private final Map<String, Connection> connections = new ConcurrentHashMap<>();
-
-    @McpTool(name = "db_create_connection", description = "Create a new database connection")
-    public Map<String, Object> db_create_connection(
-            @McpToolParam(description = "Database connection string") String connectionString,
-            @McpToolParam(description = "Database username") String username,
-            @McpToolParam(description = "Database password") String password,
-            McpMeta meta) {
-        Map<String, Object> result = new HashMap<>();
-        
+    private final IdleReaper<Connection> reaper = new IdleReaper<>("db-idle-reaper", connections, c -> {
         try {
-            String connStr = getConnectionString(connectionString, meta);
-            String user = getUsername(username, meta);
-            String pwd = getPassword(password, meta);
-            
-            if (connStr == null || connStr.isEmpty()) {
-                result.put("success", false);
-                result.put("error", "Connection string is required");
-                return result;
-            }
-            
-            String connectionId = UUID.randomUUID().toString();
-            Connection conn = java.sql.DriverManager.getConnection(connStr, user, pwd);
+            c.close();
+        } catch (Exception ignore) {
+        }
+    });
+
+    @McpTool(name = "db_create_connection", description = "Create a new database connection using the credential bound to this request (no parameters needed)")
+    public Map<String, Object> db_create_connection(McpTransportContext ctx) {
+        Map<String, Object> result = new HashMap<>();
+        ConsoleClient.Resolved cred = McpRequestFilter.credential(ctx);
+        if (cred == null || !"DATABASE".equals(cred.category())) {
+            result.put("success", false);
+            result.put("error", "当前虚拟凭据不是数据库资源");
+            return result;
+        }
+        String url = jdbcUrl(cred);
+        if (url == null) {
+            result.put("success", false);
+            result.put("error", "不支持的数据库类型: " + cred.dbType());
+            return result;
+        }
+        try {
+            // 句柄按凭据隔离: credentialId 前缀, 其他凭据的 connectionId 一律"不存在"
+            String connectionId = cred.credentialId() + ":" + UUID.randomUUID();
+            Connection conn = java.sql.DriverManager.getConnection(url, cred.username(), cred.password());
             connections.put(connectionId, conn);
-            
+            reaper.touch(connectionId);
             result.put("success", true);
             result.put("connectionId", connectionId);
+            result.put("dbType", cred.dbType());
             result.put("message", "Connection created successfully");
-            
         } catch (Exception e) {
             result.put("success", false);
             result.put("error", "Failed to create connection: " + e.getMessage());
         }
-        
         return result;
     }
 
-    private String getConnectionString(String paramValue, McpMeta meta) {
-        if (paramValue != null && !paramValue.isEmpty()) {
-            return paramValue;
-        }
-        Object metaValue = meta.get("connectionString");
-        if (metaValue != null && !((String) metaValue).isEmpty()) {
-            return (String) metaValue;
-        }
-        return McpRequestFilter.getConnectionStringFromHeader();
+    /** aisDriver 内置 mysql/postgresql/oracle/db2/gbase 驱动 */
+    static String jdbcUrl(ConsoleClient.Resolved c) {
+        String hp = c.address() + ":" + c.port();
+        String db = c.dbName() == null ? "" : c.dbName();
+        return switch (c.dbType() == null ? "" : c.dbType()) {
+            // 不强制 useSSL=false: 由驱动协商 TLS, 兼容 require_secure_transport=ON 的实例
+            case "MYSQL" -> "jdbc:mysql://" + hp + "/" + db + "?allowPublicKeyRetrieval=true";
+            case "POSTGRESQL" -> "jdbc:postgresql://" + hp + "/" + db;
+            case "ORACLE" -> "jdbc:oracle:thin:@" + hp + "/" + db;
+            case "DB2" -> "jdbc:db2://" + hp + "/" + db;
+            // GBASE8S 走 Informix 协议 (jdbc:gbasedbt-sqli), aisDriver 未打包该驱动, 归入不支持
+            case "GBASE", "GBASE8A" -> "jdbc:gbase://" + hp + "/" + db;
+            default -> null;
+        };
     }
 
-    private String getUsername(String paramValue, McpMeta meta) {
-        if (paramValue != null && !paramValue.isEmpty()) {
-            return paramValue;
+    /** 只允许操作当前请求凭据前缀下的句柄 */
+    private Connection lookup(String connectionId, McpTransportContext ctx) {
+        ConsoleClient.Resolved cred = McpRequestFilter.credential(ctx);
+        if (cred == null || connectionId == null || !connectionId.startsWith(cred.credentialId() + ":")) {
+            return null;
         }
-        Object metaValue = meta.get("username");
-        if (metaValue != null && !((String) metaValue).isEmpty()) {
-            return (String) metaValue;
-        }
-        return McpRequestFilter.getUsernameFromHeader();
-    }
-
-    private String getPassword(String paramValue, McpMeta meta) {
-        if (paramValue != null && !paramValue.isEmpty()) {
-            return paramValue;
-        }
-        Object metaValue = meta.get("password");
-        if (metaValue != null && !((String) metaValue).isEmpty()) {
-            return (String) metaValue;
-        }
-        return McpRequestFilter.getPasswordFromHeader();
+        return reaper.acquire(connectionId);
     }
 
     @McpTool(name = "db_close_connection", description = "Close an existing database connection")
     public Map<String, Object> db_close_connection(
-            @McpToolParam(description = "Connection ID to close") String connectionId) {
+            @McpToolParam(description = "Connection ID to close") String connectionId, McpTransportContext ctx) {
         Map<String, Object> result = new HashMap<>();
         
-        Connection conn = connections.remove(connectionId);
+        Connection conn = lookup(connectionId, ctx) == null ? null : connections.remove(connectionId);
         if (conn != null) {
             try {
                 conn.close();
@@ -116,13 +112,18 @@ public class DatabaseTool {
     }
 
     @McpTool(name = "db_list_connections", description = "List all valid database connections")
-    public Map<String, Object> db_list_connections() {
+    public Map<String, Object> db_list_connections(McpTransportContext ctx) {
         Map<String, Object> result = new HashMap<>();
         List<String> validConnections = new ArrayList<>();
         List<String> invalidConnections = new ArrayList<>();
+        ConsoleClient.Resolved cred = McpRequestFilter.credential(ctx);
+        String prefix = cred == null ? null : cred.credentialId() + ":";
 
         for (Map.Entry<String, Connection> entry : connections.entrySet()) {
             String connectionId = entry.getKey();
+            if (prefix == null || !connectionId.startsWith(prefix)) {
+                continue;
+            }
             Connection conn = entry.getValue();
             try {
                 if (conn.isValid(2)) {
@@ -150,10 +151,10 @@ public class DatabaseTool {
     @McpTool(name = "db_execute", description = "Execute a SQL query or update statement")
     public Map<String, Object> db_execute(
             @McpToolParam(description = "Connection ID") String connectionId,
-            @McpToolParam(description = "SQL statement to execute") String sql) {
+            @McpToolParam(description = "SQL statement to execute") String sql, McpTransportContext ctx) {
         Map<String, Object> result = new HashMap<>();
         
-        Connection conn = connections.get(connectionId);
+        Connection conn = lookup(connectionId, ctx);
         if (conn == null) {
             result.put("success", false);
             result.put("error", "Connection not found: " + connectionId);
@@ -180,10 +181,10 @@ public class DatabaseTool {
     @McpTool(name = "db_execute_transaction", description = "Execute multiple SQL statements in a transaction")
     public Map<String, Object> db_execute_transaction(
             @McpToolParam(description = "Connection ID") String connectionId,
-            @McpToolParam(description = "List of SQL statements") List<String> sqlList) {
+            @McpToolParam(description = "List of SQL statements") List<String> sqlList, McpTransportContext ctx) {
         Map<String, Object> result = new HashMap<>();
         
-        Connection conn = connections.get(connectionId);
+        Connection conn = lookup(connectionId, ctx);
         if (conn == null) {
             result.put("success", false);
             result.put("error", "Connection not found: " + connectionId);

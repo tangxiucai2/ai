@@ -19,7 +19,6 @@ public class CorsConfig {
         config.setAllowedOriginPatterns(Arrays.asList("*"));
         config.setAllowedMethods(Arrays.asList("GET", "POST", "PUT", "DELETE", "OPTIONS"));
         config.setAllowedHeaders(Arrays.asList("*"));
-        config.setExposedHeaders(Arrays.asList("X-AIDB-CONNECTION-STRING", "X-AIDB-USERNAME", "X-AIDB-PASSWORD"));
         config.setAllowCredentials(true);
         config.setMaxAge(3600L);
 
