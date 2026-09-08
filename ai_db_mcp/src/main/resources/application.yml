@@ -17,6 +17,12 @@ spring:
         capabilities:
           tool: true
 
+# 控制台对接 (智能体管控 → 访问网关)
+console:
+  url: http://127.0.0.1:5200/soag/api
+  node-id: gw-change-me
+  secret-file: ./data/gateway.secret
+
 logging:
   level:
     com.aidb.mcp: DEBUG
