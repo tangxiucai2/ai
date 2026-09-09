@@ -2,6 +2,7 @@ package com.ai.mcp.audit;
 
 import com.ai.mcp.config.ConsoleClient;
 import com.ai.mcp.config.McpRequestFilter;
+import com.fasterxml.jackson.databind.ObjectMapper;
 import io.modelcontextprotocol.common.McpTransportContext;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -10,15 +11,17 @@ import org.springframework.stereotype.Component;
 import java.util.ArrayDeque;
 import java.util.ArrayList;
 import java.util.Iterator;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.function.Supplier;
 
 /**
  * 工具调用审计: 每次 tools/call 记一条 (谁/哪个智能体/对哪个资源/做了什么/多久/结果), 同时打一行 app.log
  * <p>
- * ponytail: 内存环形 10000 条, 重启即清; 需持久/跨节点检索时由控制台落库
+ * 内存环形 10000 条供节点自查 (重启即清); 每条同时写入 AuditSpool 上报控制台落 CK 持久化
  */
 @Component
 public class AuditLog {
@@ -29,15 +32,30 @@ public class AuditLog {
     private static final int LOG_SUMMARY_MAX = 200;
 
     private static final int ERROR_MAX = 1000;
+    private static final int RESULT_MAX = 2000;
 
     public static final String SUCCESS = "SUCCESS";
     public static final String FAILED = "FAILED";
     public static final String DENIED = "DENIED";
 
     private final ArrayDeque<Entry> ring = new ArrayDeque<>();
+    private final AuditSpool spool;
+    private final ObjectMapper json;
+    private final AtomicInteger seq = new AtomicInteger();
+
+    public AuditLog(AuditSpool spool, ObjectMapper json) {
+        this.spool = spool;
+        this.json = json;
+    }
 
     public record Entry(long time, String agent, String user, String tool, String type, String resource,
                         String summary, long costMs, String status, String error, String connectionId) {
+    }
+
+    /** 上报控制台的事件 (比 Entry 多身份/结果字段) */
+    private record Event(String id, String connectionId, long time, long costMs, Long agentId, String agentCode, Long credentialId,
+                         String userName, String userId, String srcIp, String tool, String type, String status,
+                         String summary, String result, Integer lines, String error) {
     }
 
     /**
@@ -46,12 +64,14 @@ public class AuditLog {
     public Map<String, Object> run(McpTransportContext ctx, String tool, String connectionId, String summary,
                                    Supplier<Map<String, Object>> call) {
         ConsoleClient.Resolved cred = McpRequestFilter.credential(ctx);
+        String srcIp = ctx == null ? null : (String) ctx.get(McpRequestFilter.SRC_IP);
+        String userId = ctx == null ? null : (String) ctx.get(McpRequestFilter.USER_ID);
         long t0 = System.currentTimeMillis();
         Map<String, Object> r;
         try {
             r = call.get();
         } catch (RuntimeException e) {
-            record(cred, tool, summary, System.currentTimeMillis() - t0, FAILED, e.toString(), connectionId);
+            record(cred, srcIp, userId, tool, summary, t0, FAILED, e.toString(), connectionId, null, null);
             throw e;
         }
         // SSH 命令: 工具协议里非零退出码仍 success=true, 审计按退出码判失败并保留 stderr
@@ -62,13 +82,58 @@ public class AuditLog {
         String error = ok || r == null ? null
                 : nonZero ? "exit=" + exit + (r.get("errorOutput") == null ? "" : " " + r.get("errorOutput"))
                 : String.valueOf(r.get("error"));
-        record(cred, tool, summary, System.currentTimeMillis() - t0, ok ? SUCCESS : FAILED, error, cid);
+        Object[] res = resultOf(tool, r);
+        record(cred, srcIp, userId, tool, summary, t0, ok ? SUCCESS : FAILED, error, cid, (String) res[0], (Integer) res[1]);
         return r;
     }
 
     /** 鉴权链拒绝 (节点未启用 / Token / 缺头 / 控制台拒绝 / 不可达) */
-    public void denied(String agent, String user, String reason) {
-        add(new Entry(System.currentTimeMillis(), line(dash(agent)), line(dash(user)), "auth", "鉴权", "-", reason, 0, DENIED, reason, null));
+    public void denied(String agent, String user, String reason, String srcIp, String userId) {
+        long now = System.currentTimeMillis();
+        add(new Entry(now, line(dash(agent)), line(dash(user)), "auth", "鉴权", "-", reason, 0, DENIED, reason, null));
+        spool(new Event(nextId(now), null, now, 0, null, agent, null, user, userId, srcIp, "auth", "denied", DENIED, reason, null, null, reason));
+    }
+
+    /** 工具返回值 → 结果摘要 + 行数: SSH 取 stdout 前 2000 字与行数; SQL 查询取行数/列; 更新取影响行数; 事务取语句数/影响行数 */
+    @SuppressWarnings("unchecked")
+    private static Object[] resultOf(String tool, Map<String, Object> r) {
+        if (r == null) {
+            return new Object[]{null, null};
+        }
+        Object out = r.get("output");
+        if (out instanceof String s) {
+            int lines = s.isEmpty() ? 0 : (int) s.chars().filter(c -> c == '\n').count() + (s.endsWith("\n") ? 0 : 1);
+            return new Object[]{cut(s, RESULT_MAX), lines};
+        }
+        if (r.get("rowCount") instanceof Number n) {
+            return new Object[]{cut("rowCount=" + n + " columns=" + r.get("columns"), RESULT_MAX), n.intValue()};
+        }
+        if (r.get("affectedRows") instanceof Number n) {
+            return new Object[]{"affectedRows=" + n, n.intValue()};
+        }
+        if (r.get("results") instanceof List<?> list) {
+            long affected = 0;
+            for (Object o : list) {
+                if (o instanceof Map<?, ?> m && m.get("affectedRows") instanceof Number n) {
+                    affected += n.longValue();
+                }
+            }
+            return new Object[]{"statements=" + list.size() + " affectedRows=" + affected, list.size()};
+        }
+        return new Object[]{null, null};
+    }
+
+    /** 事件 id: 毫秒时间戳 + 6 位序号, 节点内唯一; 跨节点重复概率可忽略 */
+    private String nextId(long now) {
+        return now + String.format("%06d", seq.getAndIncrement() % 1_000_000);
+    }
+
+    private void spool(Event e) {
+        try {
+            spool.offer(json.writeValueAsString(e));
+        } catch (Exception ex) {
+            log.warn("AUDIT 事件序列化失败: {}", ex.toString());
+        }
     }
 
     /** 外部可控字段 (请求头/参数/命令/stderr) 去 CR/LF, 防 app.log 伪造行 */
@@ -76,11 +141,33 @@ public class AuditLog {
         return s == null ? "" : s.replace('\r', ' ').replace('\n', ' ');
     }
 
-    private void record(ConsoleClient.Resolved cred, String tool, String summary, long cost, String status, String error, String cid) {
+    private void record(ConsoleClient.Resolved cred, String srcIp, String userId, String tool, String summary, long t0,
+                        String status, String error, String cid, String result, Integer lines) {
         String s = summary == null ? "" : cut(summary, SUMMARY_MAX);
         error = error == null ? null : cut(error, ERROR_MAX);
+        long cost = System.currentTimeMillis() - t0;
+        String type = typeOf(tool, s);
         add(new Entry(System.currentTimeMillis(), cred == null ? "-" : dash(cred.agentCode()), cred == null ? "-" : dash(cred.userName()),
-                tool, typeOf(tool, s), resourceOf(cred), s, cost, status, error, cid));
+                tool, type, resourceOf(cred), s, cost, status, error, cid));
+        spool(new Event(nextId(t0), cid, t0, cost, cred == null ? null : cred.agentId(), cred == null ? null : cred.agentCode(),
+                cred == null ? null : cred.credentialId(), cred == null ? null : cred.userName(), userId, srcIp,
+                tool, eventType(tool, s), status, s, result, lines, error));
+    }
+
+    /** 上报用类型码: connect / disconnect / command / SQL 动词 (SELECT/INSERT/...) */
+    private static String eventType(String tool, String sql) {
+        return switch (tool) {
+            case "ssh_connect", "db_create_connection" -> "connect";
+            case "ssh_disconnect", "db_close_connection" -> "disconnect";
+            case "ssh_execute", "ssh_execute_long_running" -> "command";
+            case "db_execute_transaction" -> "transaction";
+            case "db_execute" -> {
+                String head = sql == null ? "" : sql.trim().toUpperCase(Locale.ROOT);
+                int sp = head.indexOf(' ');
+                yield head.isEmpty() ? "other" : (sp > 0 ? head.substring(0, sp) : head);
+            }
+            default -> tool;
+        };
     }
 
     private void add(Entry e) {

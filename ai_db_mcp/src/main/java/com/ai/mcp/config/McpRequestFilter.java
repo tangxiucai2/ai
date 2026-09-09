@@ -26,6 +26,8 @@ public class McpRequestFilter implements Filter {
 
     /** request attribute / McpTransportContext 键 */
     public static final String CREDENTIAL = "soag.credential";
+    public static final String SRC_IP = "soag.src-ip";
+    public static final String USER_ID = "soag.user-id";
 
     private final ConsoleClient console;
     private final AuditLog audit;
@@ -58,35 +60,41 @@ public class McpRequestFilter implements Filter {
         // 审计用: 鉴权失败也记录发起方声称的身份
         String agentCode = param(req, "X-Agent-Id", "agentId");
         String userName = param(req, "X-User-Name", "userName");
+        String userId = param(req, "X-User-Id", "userId");
+        String srcIp = srcIp(req);
         if (!console.isEnabled()) {
-            deny(resp, HttpServletResponse.SC_SERVICE_UNAVAILABLE, "节点未启用", agentCode, userName);
+            deny(resp, HttpServletResponse.SC_SERVICE_UNAVAILABLE, "节点未启用", agentCode, userName, srcIp, userId);
             return;
         }
         Object certs = req.getAttribute("jakarta.servlet.request.X509Certificate");
         boolean clientCertVerified = certs instanceof Object[] arr && arr.length > 0;
         if (!console.checkToken(req.getHeader("Authorization"), clientCertVerified)) {
             resp.setHeader("WWW-Authenticate", "Bearer");
-            deny(resp, HttpServletResponse.SC_UNAUTHORIZED, "Token 校验失败", agentCode, userName);
+            deny(resp, HttpServletResponse.SC_UNAUTHORIZED, "Token 校验失败", agentCode, userName, srcIp, userId);
             return;
         }
         // 智能体身份: Header 优先, Query 兜底 (客户端不支持自定义头的场景)
         String token = param(req, "X-Virtual-Token", "token");
         if (agentCode == null || token == null) {
-            deny(resp, HttpServletResponse.SC_UNAUTHORIZED, "缺少智能体标识或虚拟凭据", agentCode, userName);
+            deny(resp, HttpServletResponse.SC_UNAUTHORIZED, "缺少智能体标识或虚拟凭据", agentCode, userName, srcIp, userId);
             return;
         }
         ConsoleClient.Resolved credential;
         try {
             credential = console.resolve(agentCode, token, userName);
         } catch (ConsoleClient.Rejected e) {
-            deny(resp, HttpServletResponse.SC_FORBIDDEN, e.getMessage(), agentCode, userName);
+            deny(resp, HttpServletResponse.SC_FORBIDDEN, e.getMessage(), agentCode, userName, srcIp, userId);
             return;
         } catch (Exception e) {
             log.warn("resolve 控制台不可达 agent={}: {}", agentCode, e.toString());
-            deny(resp, HttpServletResponse.SC_SERVICE_UNAVAILABLE, "控制台不可达", agentCode, userName);
+            deny(resp, HttpServletResponse.SC_SERVICE_UNAVAILABLE, "控制台不可达", agentCode, userName, srcIp, userId);
             return;
         }
         req.setAttribute(CREDENTIAL, credential);
+        req.setAttribute(SRC_IP, srcIp);
+        if (userId != null) {
+            req.setAttribute(USER_ID, userId);
+        }
         long t0 = System.currentTimeMillis();
         console.requestBegin();
         // 在途计数: 该凭据的句柄在请求期间不被空闲回收
@@ -107,9 +115,18 @@ public class McpRequestFilter implements Filter {
         return v == null || v.isBlank() ? null : v.trim();
     }
 
-    private void deny(HttpServletResponse resp, int status, String msg, String agent, String user) throws IOException {
-        audit.denied(agent, user, msg);
+    private void deny(HttpServletResponse resp, int status, String msg, String agent, String user, String srcIp, String userId) throws IOException {
+        audit.denied(agent, user, msg, srcIp, userId);
         reject(resp, status, msg);
+    }
+
+    /** 智能体→网关的源 IP: X-Forwarded-For 首段优先 (前置代理), 否则对端地址 */
+    private static String srcIp(HttpServletRequest req) {
+        String xff = req.getHeader("X-Forwarded-For");
+        if (xff != null && !xff.isBlank()) {
+            return xff.split(",")[0].trim();
+        }
+        return req.getRemoteAddr();
     }
 
     /** sendError 的文案会被 Boot 默认错误页丢掉, 直接写 JSON 让客户端/控制台连接测试拿到原因 */

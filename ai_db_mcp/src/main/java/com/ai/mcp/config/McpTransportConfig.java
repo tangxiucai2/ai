@@ -8,6 +8,7 @@ import org.springframework.beans.factory.annotation.Value;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
 
+import java.util.HashMap;
 import java.util.Map;
 
 /**
@@ -23,8 +24,14 @@ public class McpTransportConfig {
                 .jsonMapper(new JacksonMcpJsonMapper(objectMapper))
                 .messageEndpoint(mcpEndpoint)
                 .contextExtractor(req -> {
-                    Object c = req.servletRequest().getAttribute(McpRequestFilter.CREDENTIAL);
-                    return c == null ? McpTransportContext.EMPTY : McpTransportContext.create(Map.of(McpRequestFilter.CREDENTIAL, c));
+                    Map<String, Object> ctx = new HashMap<>();
+                    for (String k : new String[]{McpRequestFilter.CREDENTIAL, McpRequestFilter.SRC_IP, McpRequestFilter.USER_ID}) {
+                        Object v = req.servletRequest().getAttribute(k);
+                        if (v != null) {
+                            ctx.put(k, v);
+                        }
+                    }
+                    return ctx.isEmpty() ? McpTransportContext.EMPTY : McpTransportContext.create(ctx);
                 })
                 .build();
     }

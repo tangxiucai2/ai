@@ -34,6 +34,7 @@ import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.LongAdder;
+import java.util.function.LongSupplier;
 
 /**
  * 控制台对接: 首次匿名注册拿密钥(落本地文件) → 60s 签名心跳; 心跳被拒(403)即 fail-closed
@@ -69,6 +70,9 @@ public class ConsoleClient {
     private volatile String authType;
     private volatile String authToken;
     private volatile long consoleRttMs;
+    // 审计 WAL 指标 (AuditSpool 启动时注入), 随心跳上报
+    private volatile LongSupplier auditPending = () -> 0;
+    private volatile LongSupplier auditDropped = () -> 0;
 
     // 身份解析缓存 key = agentCode\ntoken\nuserName; 访问序 LinkedHashMap, 超 1000 条淘汰最久未用; 拒绝不缓存
     private static final int RESOLVE_CACHE_MAX = 1000;
@@ -207,7 +211,9 @@ public class ConsoleClient {
                 "p99Ms", p99Ms(),
                 "consoleRttMs", consoleRttMs,
                 "inflight", inflight.get(),
-                "todayRequests", todayRequests());
+                "todayRequests", todayRequests(),
+                "auditPending", auditPending.getAsLong(),
+                "auditDropped", auditDropped.getAsLong());
         long t0 = System.currentTimeMillis();
         Map<String, Object> resp = signedPost("/agent/gateway/opt/report", body);
         consoleRttMs = System.currentTimeMillis() - t0;
@@ -236,7 +242,7 @@ public class ConsoleClient {
     }
 
     @SuppressWarnings("unchecked")
-    private Map<String, Object> signedPost(String path, Map<String, Object> body) throws Exception {
+    private Map<String, Object> signedPost(String path, Object body) throws Exception {
         String ts = String.valueOf(System.currentTimeMillis());
         return http.post().uri(consoleUrl + path)
                 .contentType(MediaType.APPLICATION_JSON)
@@ -245,6 +251,31 @@ public class ConsoleClient {
                 .header("X-Sign", hmac(secret, nodeId + "\n" + ts))
                 .body(body)
                 .retrieve().body(Map.class);
+    }
+
+    public void auditMetrics(LongSupplier pending, LongSupplier dropped) {
+        this.auditPending = pending;
+        this.auditDropped = dropped;
+    }
+
+    /**
+     * 批量上报审计事件 (每项已是 JSON 对象文本, 原样拼进 events 数组)
+     *
+     * @return 控制台 body code (200 成功 / 403 拒绝 / 其余重试); 未注册或网络异常返回 -1
+     */
+    public int audit(List<String> events) {
+        if (secret == null) {
+            return -1;
+        }
+        try {
+            Map<String, Object> resp = signedPost("/agent/gateway/opt/audit", "{\"events\":[" + String.join(",", events) + "]}");
+            return resp != null && resp.get("code") instanceof Number n ? n.intValue() : -1;
+        } catch (HttpClientErrorException.Unauthorized | HttpClientErrorException.Forbidden e) {
+            return 403;
+        } catch (Exception e) {
+            log.warn("ConsoleClient 审计上报失败: {}", e.toString());
+            return -1;
+        }
     }
 
     /**
