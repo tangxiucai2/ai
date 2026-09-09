@@ -3,6 +3,7 @@ package com.ai.mcp.config;
 import com.sun.management.OperatingSystemMXBean;
 import jakarta.annotation.PostConstruct;
 import jakarta.annotation.PreDestroy;
+import com.ai.mcp.audit.AuditLog;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.annotation.Value;
@@ -47,6 +48,8 @@ public class ConsoleClient {
     private static final long RETRY_INTERVAL_S = 30;
     private static final long P99_WINDOW_MS = 60_000;
     private static final long SIGN_WINDOW_MS = 5 * 60_000;
+    public static final String SRC_CONSOLE = "console";
+    public static final String SRC_SPOOL = "spool";
 
     @Value("${console.url}")
     private String consoleUrl;
@@ -73,6 +76,9 @@ public class ConsoleClient {
     // 审计 WAL 指标 (AuditSpool 启动时注入), 随心跳上报
     private volatile LongSupplier auditPending = () -> 0;
     private volatile LongSupplier auditDropped = () -> 0;
+    // 节点事件回调 (AuditLog 启动时注入) 与按来源的去重键
+    private volatile NodeAudit nodeAudit;
+    private final Map<String, String> lastNodeEvent = new ConcurrentHashMap<>();
 
     // 身份解析缓存 key = agentCode\ntoken\nuserName; 访问序 LinkedHashMap, 超 1000 条淘汰最久未用; 拒绝不缓存
     private static final int RESOLVE_CACHE_MAX = 1000;
@@ -153,9 +159,11 @@ public class ConsoleClient {
         } catch (HttpClientErrorException.Unauthorized | HttpClientErrorException.Forbidden e) {
             // 前置代理直接回 HTTP 401/403 同样视为拒绝 (控制台本身恒 HTTP 200 + body code)
             enabled = false;
+            nodeEvent(SRC_CONSOLE, AuditLog.DENIED, "控制台拒绝 HTTP " + e.getStatusCode().value() + ", /mcp 进入 503");
             log.warn("ConsoleClient 被拒 (HTTP {}), /mcp 进入 503", e.getStatusCode().value());
         } catch (Exception e) {
             // 网络异常不改变放行状态, 下轮重试
+            nodeEvent(SRC_CONSOLE, AuditLog.FAILED, "控制台不可达: " + e);
             log.warn("ConsoleClient 控制台不可达: {}", e.toString());
         }
         scheduler.schedule(this::tick, next, TimeUnit.SECONDS);
@@ -170,6 +178,7 @@ public class ConsoleClient {
         if (!isOk(resp)) {
             // 节点未登记/已禁用/控制台已下发过密钥(本地文件丢失需控制台重置密钥)
             enabled = false;
+            nodeEvent(SRC_CONSOLE, AuditLog.DENIED, "注册被拒: " + (resp == null ? null : resp.get("msg")));
             log.warn("ConsoleClient 注册被拒: {}", resp == null ? null : resp.get("msg"));
             return;
         }
@@ -200,6 +209,7 @@ public class ConsoleClient {
         unsavedData = null;
         applyAuth(data);
         enabled = "1".equals(data.get("status"));
+        nodeEvent(SRC_CONSOLE, AuditLog.SUCCESS, "注册成功, 密钥已保存");
         log.info("ConsoleClient 注册成功, 密钥已保存 {}", secretFile);
     }
 
@@ -219,6 +229,7 @@ public class ConsoleClient {
         consoleRttMs = System.currentTimeMillis() - t0;
         if (!isOk(resp)) {
             // 403: 节点被禁用/密钥被重置/已删除 → fail-closed
+            nodeEvent(SRC_CONSOLE, AuditLog.DENIED, "心跳被拒, /mcp 进入 503: " + (resp == null ? null : resp.get("msg")));
             if (enabled) {
                 log.warn("ConsoleClient 心跳被拒, /mcp 进入 503: {}", resp == null ? null : resp.get("msg"));
             }
@@ -226,6 +237,7 @@ public class ConsoleClient {
             return;
         }
         applyAuth((Map<String, Object>) resp.get("data"));
+        nodeEvent(SRC_CONSOLE, AuditLog.SUCCESS, "心跳正常, /mcp 放行");
         if (!enabled) {
             log.info("ConsoleClient 心跳正常, /mcp 放行");
         }
@@ -251,6 +263,33 @@ public class ConsoleClient {
                 .header("X-Sign", hmac(secret, nodeId + "\n" + ts))
                 .body(body)
                 .retrieve().body(Map.class);
+    }
+
+    /** 节点事件回调: 注册/心跳/审计上报的状态变化写进日志环供节点自查 */
+    public interface NodeAudit {
+        void log(String status, String summary);
+    }
+
+    public void nodeAudit(NodeAudit n) {
+        this.nodeAudit = n;
+    }
+
+    /**
+     * 记一条节点事件: 同一来源连续相同的事件只留首条 —— 心跳 30s 一轮, 持续异常否则会刷爆日志环
+     *
+     * @param source 去重分桶 (console / spool), 各来源互不影响
+     */
+    public void nodeEvent(String source, String status, String summary) {
+        // 启动竞态: 本类的首个 tick 与 AuditLog 注册监听器并发, 未装监听器时直接丢弃且不写去重键,
+        // 否则该事件会被记成"已出现过", 之后每轮相同的失败都被当重复抑制, 整个故障期日志环全空
+        NodeAudit n = nodeAudit;
+        if (n == null) {
+            return;
+        }
+        String key = status + '|' + summary;
+        if (!key.equals(lastNodeEvent.put(source, key))) {
+            n.log(status, summary);
+        }
     }
 
     public void auditMetrics(LongSupplier pending, LongSupplier dropped) {

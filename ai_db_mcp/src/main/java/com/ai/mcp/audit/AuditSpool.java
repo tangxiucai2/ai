@@ -127,6 +127,7 @@ public class AuditSpool {
                 // 停机: 循环条件转为清空队列
             } catch (Exception e) {
                 dropped.addAndGet(batch.size());
+                console.nodeEvent(ConsoleClient.SRC_SPOOL, AuditLog.FAILED, "审计落盘失败, 丢弃 " + batch.size() + " 条: " + e);
                 log.warn("AuditSpool 落盘失败, 丢弃 {} 条: {}", batch.size(), e.toString());
             } finally {
                 batch.clear();
@@ -171,6 +172,8 @@ public class AuditSpool {
             total -= size;
             dropped.addAndGet(lost);
             sent.addAndGet(lost);
+            console.nodeEvent(ConsoleClient.SRC_SPOOL, AuditLog.FAILED,
+                    "审计目录超 " + (CAP_BYTES >> 20) + "MB, 删除最旧 " + f.getFileName() + " 丢失 " + lost + " 条");
             log.warn("AuditSpool 目录超 {}MB, 删除最旧 {} 丢失 {} 条", CAP_BYTES >> 20, f.getFileName(), lost);
         }
     }
@@ -189,17 +192,20 @@ public class AuditSpool {
                 int code = console.audit(b.lines);
                 if (code == 200) {
                     commit(b);
+                    console.nodeEvent(ConsoleClient.SRC_SPOOL, AuditLog.SUCCESS, "审计上报正常");
                     backoff = BACKOFF_MIN_MS;
                     continue;
                 }
                 // 403 (节点被禁用/密钥重置): 暂停 30s; 其余 (503/网络) 指数退避
                 long wait = code == 403 ? BACKOFF_MAX_MS : backoff;
                 backoff = Math.min(backoff * 2, BACKOFF_MAX_MS);
+                console.nodeEvent(ConsoleClient.SRC_SPOOL, AuditLog.FAILED, "审计上报失败 code=" + code);
                 log.warn("AuditSpool 上报失败 code={} 待补发 {} 条, {}s 后重试", code, pending(), wait / 1000);
                 Thread.sleep(wait);
             } catch (InterruptedException e) {
                 // 停机
             } catch (Exception e) {
+                console.nodeEvent(ConsoleClient.SRC_SPOOL, AuditLog.FAILED, "审计发送异常: " + e);
                 log.warn("AuditSpool 发送异常: {}", e.toString());
                 try {
                     Thread.sleep(backoff);

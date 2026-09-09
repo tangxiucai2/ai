@@ -4,6 +4,7 @@ import com.ai.mcp.config.ConsoleClient;
 import com.ai.mcp.config.McpRequestFilter;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import io.modelcontextprotocol.common.McpTransportContext;
+import jakarta.annotation.PostConstruct;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.stereotype.Component;
@@ -41,11 +42,28 @@ public class AuditLog {
     private final ArrayDeque<Entry> ring = new ArrayDeque<>();
     private final AuditSpool spool;
     private final ObjectMapper json;
+    private final ConsoleClient console;
     private final AtomicInteger seq = new AtomicInteger();
 
-    public AuditLog(AuditSpool spool, ObjectMapper json) {
+    public AuditLog(AuditSpool spool, ObjectMapper json, ConsoleClient console) {
         this.spool = spool;
         this.json = json;
+        this.console = console;
+    }
+
+    /** 节点自身事件 (注册/心跳/审计上报) 由 ConsoleClient 与 AuditSpool 经此回调进环 */
+    @PostConstruct
+    void registerNodeAudit() {
+        console.nodeAudit(this::node);
+    }
+
+    /**
+     * 节点自身事件: 只进内存环与 app.log, 不上报控制台 —— CK 那张表是智能体调用日志,
+     * 混入节点运维事件会污染「今日调用」统计
+     */
+    public void node(String status, String summary) {
+        String s = summary == null ? "" : cut(summary, SUMMARY_MAX);
+        add(new Entry(System.currentTimeMillis(), "-", "-", "node", "节点", "-", s, 0, status, null, null));
     }
 
     public record Entry(long time, String agent, String user, String tool, String type, String resource,
