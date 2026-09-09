@@ -17,12 +17,14 @@ import org.springaicommunity.mcp.annotation.McpTool;
 import org.springaicommunity.mcp.annotation.McpToolParam;
 import org.springframework.stereotype.Component;
 
+import com.ai.mcp.audit.AuditLog;
 import com.ai.mcp.config.ConsoleClient;
 import com.ai.mcp.config.McpRequestFilter;
 
 @Component
 public class DatabaseTool {
 
+    private final AuditLog audit;
     private final Map<String, Connection> connections = new ConcurrentHashMap<>();
     private final IdleReaper<Connection> reaper = new IdleReaper<>("db-idle-reaper", connections, c -> {
         try {
@@ -31,8 +33,16 @@ public class DatabaseTool {
         }
     });
 
+    public DatabaseTool(AuditLog audit) {
+        this.audit = audit;
+    }
+
     @McpTool(name = "db_create_connection", description = "Create a new database connection using the credential bound to this request (no parameters needed)")
     public Map<String, Object> db_create_connection(McpTransportContext ctx) {
+        return audit.run(ctx, "db_create_connection", null, "connect", () -> db_create_connection0(ctx));
+    }
+
+        private Map<String, Object> db_create_connection0(McpTransportContext ctx) {
         Map<String, Object> result = new HashMap<>();
         ConsoleClient.Resolved cred = McpRequestFilter.credential(ctx);
         if (cred == null || !"DATABASE".equals(cred.category())) {
@@ -91,6 +101,10 @@ public class DatabaseTool {
     @McpTool(name = "db_close_connection", description = "Close an existing database connection")
     public Map<String, Object> db_close_connection(
             @McpToolParam(description = "Connection ID to close") String connectionId, McpTransportContext ctx) {
+        return audit.run(ctx, "db_close_connection", connectionId, "disconnect", () -> db_close_connection0(connectionId, ctx));
+    }
+
+        private Map<String, Object> db_close_connection0(String connectionId, McpTransportContext ctx) {
         Map<String, Object> result = new HashMap<>();
         
         Connection conn = lookup(connectionId, ctx) == null ? null : connections.remove(connectionId);
@@ -152,6 +166,10 @@ public class DatabaseTool {
     public Map<String, Object> db_execute(
             @McpToolParam(description = "Connection ID") String connectionId,
             @McpToolParam(description = "SQL statement to execute") String sql, McpTransportContext ctx) {
+        return audit.run(ctx, "db_execute", connectionId, sql, () -> db_execute0(connectionId, sql, ctx));
+    }
+
+        private Map<String, Object> db_execute0(String connectionId, String sql, McpTransportContext ctx) {
         Map<String, Object> result = new HashMap<>();
         
         Connection conn = lookup(connectionId, ctx);
@@ -182,6 +200,11 @@ public class DatabaseTool {
     public Map<String, Object> db_execute_transaction(
             @McpToolParam(description = "Connection ID") String connectionId,
             @McpToolParam(description = "List of SQL statements") List<String> sqlList, McpTransportContext ctx) {
+        return audit.run(ctx, "db_execute_transaction", connectionId, sqlList == null ? "" : String.join("; ", sqlList),
+                () -> db_execute_transaction0(connectionId, sqlList, ctx));
+    }
+
+        private Map<String, Object> db_execute_transaction0(String connectionId, List<String> sqlList, McpTransportContext ctx) {
         Map<String, Object> result = new HashMap<>();
         
         Connection conn = lookup(connectionId, ctx);

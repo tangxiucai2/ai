@@ -1,5 +1,6 @@
 package com.ai.mcp.tool;
 
+import com.ai.mcp.audit.AuditLog;
 import com.ai.mcp.config.ConsoleClient;
 import com.ai.mcp.config.McpRequestFilter;
 import com.jcraft.jsch.*;
@@ -21,12 +22,21 @@ import java.util.concurrent.ConcurrentHashMap;
 @Component
 public class SshTool {
 
+    private final AuditLog audit;
     private final Map<String, Session> sessions = new ConcurrentHashMap<>();
     private final IdleReaper<Session> reaper = new IdleReaper<>("ssh-idle-reaper", sessions, Session::disconnect);
     private final Map<String, ChannelExec> activeChannels = new ConcurrentHashMap<>();
 
+    public SshTool(AuditLog audit) {
+        this.audit = audit;
+    }
+
     @McpTool(name = "ssh_connect", description = "Create a new SSH connection using the credential bound to this request (no parameters needed)")
     public Map<String, Object> ssh_connect(McpTransportContext ctx) {
+        return audit.run(ctx, "ssh_connect", null, "connect", () -> ssh_connect0(ctx));
+    }
+
+        private Map<String, Object> ssh_connect0(McpTransportContext ctx) {
         Map<String, Object> result = new HashMap<>();
         ConsoleClient.Resolved cred = McpRequestFilter.credential(ctx);
         if (cred == null || !"HOST".equals(cred.category())) {
@@ -116,6 +126,10 @@ public class SshTool {
     @McpTool(name = "ssh_disconnect", description = "Close an existing SSH connection")
     public Map<String, Object> ssh_disconnect(
             @McpToolParam(description = "Connection ID to close") String connectionId, McpTransportContext ctx) {
+        return audit.run(ctx, "ssh_disconnect", connectionId, "disconnect", () -> ssh_disconnect0(connectionId, ctx));
+    }
+
+        private Map<String, Object> ssh_disconnect0(String connectionId, McpTransportContext ctx) {
         
         Map<String, Object> result = new HashMap<>();
         
@@ -184,6 +198,10 @@ public class SshTool {
     public Map<String, Object> ssh_execute(
             @McpToolParam(description = "Connection ID") String connectionId,
             @McpToolParam(description = "Command to execute") String command, McpTransportContext ctx) {
+        return audit.run(ctx, "ssh_execute", connectionId, command, () -> ssh_execute0(connectionId, command, ctx));
+    }
+
+        private Map<String, Object> ssh_execute0(String connectionId, String command, McpTransportContext ctx) {
         
         Map<String, Object> result = new HashMap<>();
         
@@ -294,6 +312,10 @@ public class SshTool {
             @McpToolParam(description = "Connection ID") String connectionId,
             @McpToolParam(description = "Command to execute") String command,
             @McpToolParam(description = "Timeout in milliseconds (0 for no timeout)") Long timeout, McpTransportContext ctx) {
+        return audit.run(ctx, "ssh_execute_long_running", connectionId, command, () -> ssh_execute_long_running0(connectionId, command, timeout, ctx));
+    }
+
+        private Map<String, Object> ssh_execute_long_running0(String connectionId, String command, Long timeout, McpTransportContext ctx) {
         
         Map<String, Object> result = new HashMap<>();
         

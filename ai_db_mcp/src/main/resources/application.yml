@@ -25,5 +25,5 @@ console:
 
 logging:
   level:
-    com.aidb.mcp: DEBUG
+    com.ai.mcp: INFO
     org.springframework.ai: DEBUG

@@ -45,6 +45,7 @@ public class ConsoleClient {
     private static final long REPORT_INTERVAL_S = 30;
     private static final long RETRY_INTERVAL_S = 30;
     private static final long P99_WINDOW_MS = 60_000;
+    private static final long SIGN_WINDOW_MS = 5 * 60_000;
 
     @Value("${console.url}")
     private String consoleUrl;
@@ -80,7 +81,8 @@ public class ConsoleClient {
 
     /** 控制台解析出的连接信息 + 真实凭据 (只在内存, 不落盘不打日志) */
     public record Resolved(long agentId, long credentialId, String category, String dbType, String address,
-                           Integer port, String dbName, String username, String password) {
+                           Integer port, String dbName, String username, String password,
+                           String agentCode, String userName) {
     }
 
     private record CachedResolved(Resolved value, long expireAt) {
@@ -287,7 +289,9 @@ public class ConsoleClient {
                 d.get("port") == null ? null : ((Number) d.get("port")).intValue(),
                 (String) d.get("dbName"),
                 (String) d.get("username"),
-                (String) d.get("password"));
+                (String) d.get("password"),
+                agentCode,
+                userName);
         long ttl = d.get("ttlSeconds") == null ? 60 : ((Number) d.get("ttlSeconds")).longValue();
         synchronized (resolveCache) {
             resolveCache.put(key, new CachedResolved(r, now + ttl * 1000));
@@ -319,6 +323,26 @@ public class ConsoleClient {
         return java.security.MessageDigest.isEqual(
                 authorization.substring(7).getBytes(StandardCharsets.UTF_8),
                 token.getBytes(StandardCharsets.UTF_8));
+    }
+
+    /**
+     * 控制台 → 节点 的反向签名 (拉审计日志): hmac(secret, "console\n" + nodeId + "\n" + ts), 前缀区别于节点 → 控制台方向防互放
+     */
+    public boolean verifyConsoleSign(String ts, String sign) {
+        String s = secret;
+        if (s == null || ts == null || sign == null) {
+            return false;
+        }
+        try {
+            if (Math.abs(System.currentTimeMillis() - Long.parseLong(ts)) > SIGN_WINDOW_MS) {
+                return false;
+            }
+            return java.security.MessageDigest.isEqual(
+                    hmac(s, "console\n" + nodeId + "\n" + ts).getBytes(StandardCharsets.UTF_8),
+                    sign.trim().toLowerCase(java.util.Locale.ROOT).getBytes(StandardCharsets.UTF_8));
+        } catch (Exception e) {
+            return false;
+        }
     }
 
     public void requestBegin() {

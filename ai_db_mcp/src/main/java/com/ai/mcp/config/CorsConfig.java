@@ -1,5 +1,6 @@
 package com.ai.mcp.config;
 
+import com.ai.mcp.audit.AuditLog;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.boot.web.servlet.FilterRegistrationBean;
 import org.springframework.context.annotation.Bean;
@@ -31,10 +32,10 @@ public class CorsConfig {
     }
 
     @Bean
-    public FilterRegistrationBean<McpRequestFilter> mcpRequestFilter(ConsoleClient consoleClient,
+    public FilterRegistrationBean<McpRequestFilter> mcpRequestFilter(ConsoleClient consoleClient, AuditLog auditLog,
             @Value("${spring.ai.mcp.server.streamable-http.mcp-endpoint:/mcp}") String mcpEndpoint) {
         FilterRegistrationBean<McpRequestFilter> registrationBean = new FilterRegistrationBean<>();
-        registrationBean.setFilter(new McpRequestFilter(consoleClient, mcpEndpoint));
+        registrationBean.setFilter(new McpRequestFilter(consoleClient, auditLog, mcpEndpoint));
         registrationBean.addUrlPatterns("/*");
         registrationBean.setOrder(1);
         return registrationBean;
