@@ -44,6 +44,12 @@ public class SshTool {
             result.put("error", "当前虚拟凭据不是主机资源");
             return result;
         }
+        // 节点句柄总量闸门 (控制台下发 maxConnections, 未配置不限)
+        if (IdleReaper.atLimit()) {
+            result.put("success", false);
+            result.put("error", "节点连接数已达上限, 请稍后重试或释放空闲连接");
+            return result;
+        }
         String host = cred.address();
         Integer port = cred.port();
         String username = cred.username();

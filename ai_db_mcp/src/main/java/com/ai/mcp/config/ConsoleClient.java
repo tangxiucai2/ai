@@ -4,6 +4,7 @@ import com.sun.management.OperatingSystemMXBean;
 import jakarta.annotation.PostConstruct;
 import jakarta.annotation.PreDestroy;
 import com.ai.mcp.audit.AuditLog;
+import com.ai.mcp.tool.IdleReaper;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.annotation.Value;
@@ -34,6 +35,7 @@ import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.atomic.LongAdder;
 import java.util.function.LongSupplier;
 
@@ -72,6 +74,11 @@ public class ConsoleClient {
     private volatile boolean enabled = false;
     private volatile String authType;
     private volatile String authToken;
+    // 控制台下发的单节点 QPS 配额, 0=不限; 秒级固定窗计数器: 高 32 位窗口秒 + 低 32 位计数
+    private volatile int maxQps;
+    private final AtomicLong qpsWindow = new AtomicLong();
+    /** 限流窗只做相邻比较, 用单调时钟: 墙钟被 NTP 回拨时按秒差会一直落在旧窗内, 配额耗尽后持续 429 */
+    private static final long NANO_BASE = System.nanoTime();
     private volatile long consoleRttMs;
     // 审计 WAL 指标 (AuditSpool 启动时注入), 随心跳上报
     private volatile LongSupplier auditPending = () -> 0;
@@ -222,6 +229,7 @@ public class ConsoleClient {
                 "consoleRttMs", consoleRttMs,
                 "inflight", inflight.get(),
                 "todayRequests", todayRequests(),
+                "connections", IdleReaper.totalHandles(),
                 "auditPending", auditPending.getAsLong(),
                 "auditDropped", auditDropped.getAsLong());
         long t0 = System.currentTimeMillis();
@@ -247,6 +255,40 @@ public class ConsoleClient {
     private void applyAuth(Map<String, Object> data) {
         authType = (String) data.get("authType");
         authToken = (String) data.get("authToken");
+        maxQps = intOf(data.get("maxQps"));
+        IdleReaper.setMaxConnections(intOf(data.get("maxConnections")));
+    }
+
+    /** 控制台未配置该限额时下发 null, 统一折成 0 (不限) */
+    private static int intOf(Object v) {
+        return v instanceof Number n ? n.intValue() : 0;
+    }
+
+    /**
+     * QPS 闸门: 超过单节点配额返回 false, 未配置(0)恒放行.
+     * ponytail: 秒级固定窗, 跨窗边界最坏放过 2 倍瞬时量; 要平滑再换滑动窗或令牌桶
+     */
+    public boolean tryAcquire() {
+        int max = maxQps;
+        if (max <= 0) {
+            return true;
+        }
+        while (true) {
+            long cur = qpsWindow.get();
+            // 每轮重读时钟: 重试期间可能已跨秒; 且只在 sec 更大时换窗, 否则被挂起的旧线程能把窗口写回上一秒、
+            // 清空已消耗的配额, 让新的一秒再拿一次满额 (旧线程落到 else 分支, 消耗当前窗口的配额)
+            long sec = (System.nanoTime() - NANO_BASE) / 1_000_000_000L;
+            if (sec > (cur >>> 32)) {
+                // 换窗与计数一次 CAS 完成, 并发换窗只有一方成功, 输方重读后走同窗分支
+                if (qpsWindow.compareAndSet(cur, (sec << 32) | 1L)) {
+                    return true;
+                }
+            } else if ((int) cur >= max) {
+                return false;
+            } else if (qpsWindow.compareAndSet(cur, cur + 1)) {
+                return true;
+            }
+        }
     }
 
     private static boolean isOk(Map<String, Object> resp) {

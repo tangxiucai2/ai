@@ -5,6 +5,7 @@ import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.Executors;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
@@ -18,6 +19,34 @@ import java.util.function.Consumer;
 public final class IdleReaper<T> {
 
     static final long IDLE_MS = TimeUnit.MINUTES.toMillis(30);
+
+    /** 全部句柄表 (SshTool/DatabaseTool 各一个 reaper), 用于连接数统计与总量限额 */
+    private static final List<IdleReaper<?>> ALL = new CopyOnWriteArrayList<>();
+
+    /** 控制台心跳下发的连接数上限, 0=不限 */
+    private static volatile int maxConnections;
+
+    public static void setMaxConnections(int max) {
+        maxConnections = max;
+    }
+
+    /** 当前持有的后端句柄总数 (SSH Session + JDBC Connection), 上报控制台作「当前连接数」 */
+    public static int totalHandles() {
+        int n = 0;
+        for (IdleReaper<?> r : ALL) {
+            n += r.handles.size();
+        }
+        return n;
+    }
+
+    /**
+     * 建连前的总量闸门: 已达上限返回 true.
+     * ponytail: 读-判-建非原子, 并发建连最多超出并发数个句柄, 空闲回收会收敛; 需要硬上限再加信号量
+     */
+    public static boolean atLimit() {
+        int max = maxConnections;
+        return max > 0 && totalHandles() >= max;
+    }
 
     /** credentialId → 在途请求数 */
     private static final Map<Long, AtomicInteger> IN_FLIGHT = new ConcurrentHashMap<>();
@@ -79,6 +108,7 @@ public final class IdleReaper<T> {
     IdleReaper(String name, Map<String, T> handles, Consumer<T> close) {
         this.handles = handles;
         this.close = close;
+        ALL.add(this);
         Executors.newSingleThreadScheduledExecutor(r -> {
             Thread t = new Thread(r, name);
             t.setDaemon(true);

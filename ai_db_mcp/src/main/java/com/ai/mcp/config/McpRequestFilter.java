@@ -12,6 +12,7 @@ import org.slf4j.LoggerFactory;
 import org.springframework.web.util.UrlPathHelper;
 
 import java.io.IOException;
+import java.util.concurrent.atomic.AtomicLong;
 import java.nio.charset.StandardCharsets;
 
 /**
@@ -29,10 +30,17 @@ public class McpRequestFilter implements Filter {
     public static final String SRC_IP = "soag.src-ip";
     public static final String USER_ID = "soag.user-id";
 
+    /** 429 无 Servlet 常量 */
+    private static final int SC_TOO_MANY_REQUESTS = 429;
+
     private final ConsoleClient console;
     private final AuditLog audit;
     // 与传输层共用端点配置, 避免改了 mcp-endpoint 后鉴权仍只盯 /mcp
     private final String mcpEndpoint;
+    // 限流拒绝的审计节流窗 (秒): 超限时请求密集, 每条都记会把日志环冲空
+    // CAS 而非 volatile: 读-判-写有竞争时每秒会记到"并发线程数"条, 节流形同虚设; 时钟同 tryAcquire 用单调源
+    private static final long NANO_BASE = System.nanoTime();
+    private final AtomicLong lastQpsDenySec = new AtomicLong(-1);
 
     public McpRequestFilter(ConsoleClient console, AuditLog audit, String mcpEndpoint) {
         this.console = console;
@@ -71,6 +79,18 @@ public class McpRequestFilter implements Filter {
         if (!console.checkToken(req.getHeader("Authorization"), clientCertVerified)) {
             resp.setHeader("WWW-Authenticate", "Bearer");
             deny(resp, HttpServletResponse.SC_UNAUTHORIZED, "Token 校验失败", agentCode, userName, srcIp, userId);
+            return;
+        }
+        // QPS 闸门放在 Token 校验之后: 匿名流量打不满配额饿死正常调用; 又在 resolve 之前, 超限时不再压控制台
+        if (!console.tryAcquire()) {
+            resp.setHeader("Retry-After", "1");
+            long sec = (System.nanoTime() - NANO_BASE) / 1_000_000_000L;
+            long last = lastQpsDenySec.get();
+            if (sec > last && lastQpsDenySec.compareAndSet(last, sec)) {
+                deny(resp, SC_TOO_MANY_REQUESTS, "超过 QPS 限制", agentCode, userName, srcIp, userId);
+            } else {
+                reject(resp, SC_TOO_MANY_REQUESTS, "超过 QPS 限制");
+            }
             return;
         }
         // 智能体身份: Header 优先, Query 兜底 (客户端不支持自定义头的场景)
