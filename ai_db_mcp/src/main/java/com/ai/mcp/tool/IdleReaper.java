@@ -48,6 +48,36 @@ public final class IdleReaper<T> {
         return max > 0 && totalHandles() >= max;
     }
 
+    /** 控制台心跳下发的单资源连接数上限, 0=不限 */
+    private static volatile int maxResourceConnections;
+
+    public static void setMaxResourceConnections(int max) {
+        maxResourceConnections = max;
+    }
+
+    /** 单台资源 (address:port) 当前持有的句柄数: 以 handles 为准逐个查表, resourceOf 有残留也不会多计 */
+    static int handlesOf(String resource) {
+        int n = 0;
+        for (IdleReaper<?> r : ALL) {
+            for (String id : r.handles.keySet()) {
+                if (resource.equals(r.resourceOf.get(id))) {
+                    n++;
+                }
+            }
+        }
+        return n;
+    }
+
+    /**
+     * 建连前的单资源闸门: 该 address:port 已达上限返回 true.
+     * 跨凭据合并计数: 目标机不认账号只认连接数, 同一台机器不同凭据的句柄算在一起.
+     * ponytail: 与 atLimit() 同构, 读-判-建非原子, 超发不超过并发建连数; 要硬上限再上信号量
+     */
+    public static boolean atResourceLimit(String resource) {
+        int max = maxResourceConnections;
+        return max > 0 && handlesOf(resource) >= max;
+    }
+
     /** credentialId → 在途请求数 */
     private static final Map<Long, AtomicInteger> IN_FLIGHT = new ConcurrentHashMap<>();
 
@@ -102,6 +132,8 @@ public final class IdleReaper<T> {
 
     private final Map<String, T> handles;
     private final Consumer<T> close;
+    /** connectionId → address:port, 仅供 handlesOf 查表; 权威是 handles, 残留由 sweep 清 */
+    private final Map<String, String> resourceOf = new ConcurrentHashMap<>();
     /** guarded by this */
     private final Map<String, Long> lastUsed = new HashMap<>();
 
@@ -118,6 +150,12 @@ public final class IdleReaper<T> {
 
     synchronized void touch(String id) {
         lastUsed.put(id, System.currentTimeMillis());
+    }
+
+    /** 建连后登记: 记使用时间 + 所属资源, 供单资源限额计数 */
+    void register(String id, String resource) {
+        resourceOf.put(id, resource);
+        touch(id);
     }
 
     /** 刷新使用时间并取句柄, 与 sweep 互斥: 取到的句柄不会被同一轮扫描关闭 */
@@ -142,6 +180,8 @@ public final class IdleReaper<T> {
                 return true;
             });
         }
+        // 句柄没了就清查表项: 工具侧各处 remove 与本轮 sweep 一并覆盖
+        resourceOf.keySet().removeIf(id -> !handles.containsKey(id));
         purge(deadline);
         // 锁外关闭: close 可能阻塞, 不能拖住其他凭据的 acquire
         for (T h : expired) {

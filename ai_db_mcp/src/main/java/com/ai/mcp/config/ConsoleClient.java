@@ -257,6 +257,7 @@ public class ConsoleClient {
         authToken = (String) data.get("authToken");
         maxQps = intOf(data.get("maxQps"));
         IdleReaper.setMaxConnections(intOf(data.get("maxConnections")));
+        IdleReaper.setMaxResourceConnections(intOf(data.get("maxResourceConnections")));
     }
 
     /** 控制台未配置该限额时下发 null, 统一折成 0 (不限) */

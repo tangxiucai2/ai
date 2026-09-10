@@ -54,12 +54,19 @@ public class SshTool {
         Integer port = cred.port();
         String username = cred.username();
         String password = cred.password();
+        int sshPort = port != null ? port : 22;
+        // 单资源闸门 (跨凭据合并计数: 同一台机器不论哪个账号登录都算在一起)
+        String resource = host + ":" + sshPort;
+        if (IdleReaper.atResourceLimit(resource)) {
+            result.put("success", false);
+            result.put("error", "该资源连接数已达上限, 请稍后重试或释放空闲连接");
+            return result;
+        }
         
         JSch jsch = new JSch();
         Session session = null;
         
         try {
-            int sshPort = port != null ? port : 22;
             session = jsch.getSession(username, host, sshPort);
             
             session.setPassword(password);
@@ -79,7 +86,7 @@ public class SshTool {
             // 句柄按凭据隔离: credentialId 前缀
             String connectionId = cred.credentialId() + ":" + UUID.randomUUID();
             sessions.put(connectionId, session);
-            reaper.touch(connectionId);
+            reaper.register(connectionId, resource);
             
             result.put("success", true);
             result.put("connectionId", connectionId);

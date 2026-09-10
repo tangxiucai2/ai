@@ -56,6 +56,13 @@ public class DatabaseTool {
             result.put("error", "节点连接数已达上限, 请稍后重试或释放空闲连接");
             return result;
         }
+        // 单资源闸门 (跨凭据合并计数: 同一个实例不论哪个账号登录都算在一起), 与 jdbcUrl 同款拼法
+        String resource = cred.address() + ":" + cred.port();
+        if (IdleReaper.atResourceLimit(resource)) {
+            result.put("success", false);
+            result.put("error", "该资源连接数已达上限, 请稍后重试或释放空闲连接");
+            return result;
+        }
         String url = jdbcUrl(cred);
         if (url == null) {
             result.put("success", false);
@@ -67,7 +74,7 @@ public class DatabaseTool {
             String connectionId = cred.credentialId() + ":" + UUID.randomUUID();
             Connection conn = java.sql.DriverManager.getConnection(url, cred.username(), cred.password());
             connections.put(connectionId, conn);
-            reaper.touch(connectionId);
+            reaper.register(connectionId, resource);
             result.put("success", true);
             result.put("connectionId", connectionId);
             result.put("dbType", cred.dbType());
