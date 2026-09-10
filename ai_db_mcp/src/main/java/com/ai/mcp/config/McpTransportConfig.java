@@ -25,7 +25,9 @@ public class McpTransportConfig {
                 .messageEndpoint(mcpEndpoint)
                 .contextExtractor(req -> {
                     Map<String, Object> ctx = new HashMap<>();
-                    for (String k : new String[]{McpRequestFilter.CREDENTIAL, McpRequestFilter.SRC_IP, McpRequestFilter.USER_ID}) {
+                    for (String k : new String[]{McpRequestFilter.CREDENTIAL, McpRequestFilter.USER_IDENTITY,
+                            McpRequestFilter.USER_TOKEN, McpRequestFilter.IN_FLIGHT, McpRequestFilter.RESOLVED, McpRequestFilter.DENY_REASON,
+                            McpRequestFilter.SRC_IP, McpRequestFilter.USER_ID}) {
                         Object v = req.servletRequest().getAttribute(k);
                         if (v != null) {
                             ctx.put(k, v);

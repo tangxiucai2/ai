@@ -55,12 +55,12 @@ public final class IdleReaper<T> {
         maxResourceConnections = max;
     }
 
-    /** 单台资源 (address:port) 当前持有的句柄数: 以 handles 为准逐个查表, resourceOf 有残留也不会多计 */
+    /** 单台资源 (address:port) 当前持有的句柄数: 资源写在 Conn 里, 与句柄同生共死, 不会多计漏计 */
     static int handlesOf(String resource) {
         int n = 0;
         for (IdleReaper<?> r : ALL) {
-            for (String id : r.handles.keySet()) {
-                if (resource.equals(r.resourceOf.get(id))) {
+            for (Conn<?> c : r.handles.values()) {
+                if (resource.equals(c.meta().resource())) {
                     n++;
                 }
             }
@@ -130,14 +130,12 @@ public final class IdleReaper<T> {
         });
     }
 
-    private final Map<String, T> handles;
+    private final Map<String, Conn<T>> handles;
     private final Consumer<T> close;
-    /** connectionId → address:port, 仅供 handlesOf 查表; 权威是 handles, 残留由 sweep 清 */
-    private final Map<String, String> resourceOf = new ConcurrentHashMap<>();
     /** guarded by this */
     private final Map<String, Long> lastUsed = new HashMap<>();
 
-    IdleReaper(String name, Map<String, T> handles, Consumer<T> close) {
+    IdleReaper(String name, Map<String, Conn<T>> handles, Consumer<T> close) {
         this.handles = handles;
         this.close = close;
         ALL.add(this);
@@ -152,16 +150,28 @@ public final class IdleReaper<T> {
         lastUsed.put(id, System.currentTimeMillis());
     }
 
-    /** 建连后登记: 记使用时间 + 所属资源, 供单资源限额计数 */
-    void register(String id, String resource) {
-        resourceOf.put(id, resource);
+    /** 建连后登记使用时间 (资源归属已随 Conn 一次 put 落定, 无需另表) */
+    void register(String id) {
         touch(id);
     }
 
-    /** 刷新使用时间并取句柄, 与 sweep 互斥: 取到的句柄不会被同一轮扫描关闭 */
-    synchronized T acquire(String id) {
-        lastUsed.put(id, System.currentTimeMillis());
+    /**
+     * 只读取连接, 不刷新使用时间
+     * <p>
+     * 归属与授权校验必须走这个: 若先刷新再校验, 被撤权的用户只要定期拿旧 connectionId 发请求,
+     * 每次都被拒却每次都续了期, 连接永不进入空闲回收, 持续占着句柄与配额
+     */
+    synchronized Conn<T> peek(String id) {
         return handles.get(id);
+    }
+
+    /** 校验通过后再刷新使用时间并取连接, 与 sweep 互斥: 取到的句柄不会被同一轮扫描关闭 */
+    synchronized Conn<T> acquire(String id) {
+        Conn<T> conn = handles.get(id);
+        if (conn != null) {
+            lastUsed.put(id, System.currentTimeMillis());
+        }
+        return conn;
     }
 
     void sweep() {
@@ -176,12 +186,18 @@ public final class IdleReaper<T> {
                 if (e.getValue() >= deadline || active(id, deadline)) {
                     return false;
                 }
-                expired.add(handles.remove(id));
+                Conn<T> conn = handles.remove(id);
+                if (conn != null) {
+                    expired.add(conn.handle());
+                }
                 return true;
             });
+            // 兜底: 有句柄但没时间项的补登记, 否则该句柄永远不进回收视野 (register 抛异常时会出现)
+            long now = System.currentTimeMillis();
+            for (String id : handles.keySet()) {
+                lastUsed.putIfAbsent(id, now);
+            }
         }
-        // 句柄没了就清查表项: 工具侧各处 remove 与本轮 sweep 一并覆盖
-        resourceOf.keySet().removeIf(id -> !handles.containsKey(id));
         purge(deadline);
         // 锁外关闭: close 可能阻塞, 不能拖住其他凭据的 acquire
         for (T h : expired) {

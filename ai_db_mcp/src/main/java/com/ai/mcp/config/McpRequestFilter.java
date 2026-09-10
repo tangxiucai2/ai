@@ -27,6 +27,21 @@ public class McpRequestFilter implements Filter {
 
     /** request attribute / McpTransportContext 键 */
     public static final String CREDENTIAL = "soag.credential";
+
+    /** 用户自选模式的可信身份 (ConsoleClient.ResolvedUser) */
+    public static final String USER_IDENTITY = "soag.userIdentity";
+
+    /** 用户自选模式的原始用户 Token, 供工具层换取凭据 */
+    public static final String USER_TOKEN = "soag.userToken";
+
+    /** 用户自选模式本次请求的在途凭据集合: 工具层 begin 后写入, Filter 的 finally 统一 end */
+    public static final String IN_FLIGHT = "soag.inFlight";
+
+    /** 用户自选模式本次请求解析出的凭据: 工具层换取后写入, 供审计补齐资源与 credentialId */
+    public static final String RESOLVED = "soag.resolved";
+
+    /** 授权重校验被拒的原因: 供审计记录真实原因而非笼统的「连接不存在」 */
+    public static final String DENY_REASON = "soag.denyReason";
     public static final String SRC_IP = "soag.src-ip";
     public static final String USER_ID = "soag.user-id";
 
@@ -94,14 +109,22 @@ public class McpRequestFilter implements Filter {
             return;
         }
         // 智能体身份: Header 优先, Query 兜底 (客户端不支持自定义头的场景)
+        // 两种模式并存: 带虚拟凭据走固定资源模式 (老路径, 逐字节不变); 只带用户 Token 走用户自选模式.
+        // 两个都带时以虚拟凭据优先 —— 更具体的胜出; 也避免 URL 里残留的 token 把模式意外切走
         String token = param(req, "X-Virtual-Token", "token");
-        if (agentCode == null || token == null) {
-            deny(resp, HttpServletResponse.SC_UNAUTHORIZED, "缺少智能体标识或虚拟凭据", agentCode, userName, srcIp, userId);
+        String userToken = token != null ? null : param(req, "X-User-Token", "userToken");
+        if (agentCode == null || (token == null && userToken == null)) {
+            deny(resp, HttpServletResponse.SC_UNAUTHORIZED, "缺少智能体标识或凭据", agentCode, userName, srcIp, userId);
             return;
         }
-        ConsoleClient.Resolved credential;
+        ConsoleClient.Resolved credential = null;
+        ConsoleClient.ResolvedUser identity = null;
         try {
-            credential = console.resolve(agentCode, token, userName);
+            if (token != null) {
+                credential = console.resolve(agentCode, token, userName);
+            } else {
+                identity = console.resolveUser(agentCode, userToken);
+            }
         } catch (ConsoleClient.Rejected e) {
             deny(resp, HttpServletResponse.SC_FORBIDDEN, e.getMessage(), agentCode, userName, srcIp, userId);
             return;
@@ -110,19 +133,41 @@ public class McpRequestFilter implements Filter {
             deny(resp, HttpServletResponse.SC_SERVICE_UNAVAILABLE, "控制台不可达", agentCode, userName, srcIp, userId);
             return;
         }
-        req.setAttribute(CREDENTIAL, credential);
-        req.setAttribute(SRC_IP, srcIp);
-        if (userId != null) {
-            req.setAttribute(USER_ID, userId);
+        if (credential != null) {
+            req.setAttribute(CREDENTIAL, credential);
+        } else {
+            req.setAttribute(USER_IDENTITY, identity);
+            req.setAttribute(USER_TOKEN, userToken);
+            req.setAttribute(IN_FLIGHT, java.util.concurrent.ConcurrentHashMap.<Long>newKeySet());
+            req.setAttribute(RESOLVED, new java.util.concurrent.atomic.AtomicReference<ConsoleClient.Resolved>());
+            req.setAttribute(DENY_REASON, new java.util.concurrent.atomic.AtomicReference<String>());
+            // 身份可信后覆盖客户端自称的两个用户字段, 不留「可信用户名 + 可伪造用户 ID」的半可信组合
+            userName = identity.userName();
+            userId = String.valueOf(identity.userId());
         }
+        req.setAttribute(SRC_IP, srcIp);
+        req.setAttribute(USER_ID, userId);
         long t0 = System.currentTimeMillis();
         console.requestBegin();
-        // 在途计数: 该凭据的句柄在请求期间不被空闲回收
-        IdleReaper.begin(credential.credentialId());
+        // 在途计数: 该凭据的句柄在请求期间不被空闲回收.
+        // 用户自选模式此刻还不知道凭据, 保护下移到工具层 (取得句柄前 begin, finally end)
+        Long inFlight = credential == null ? null : credential.credentialId();
+        if (inFlight != null) {
+            IdleReaper.begin(inFlight);
+        }
         try {
             chain.doFilter(request, response);
         } finally {
-            IdleReaper.end(credential.credentialId());
+            if (inFlight != null) {
+                IdleReaper.end(inFlight);
+            } else {
+                // 工具层 begin 的逐个 end: 放在 Filter 的 finally 才能覆盖工具内提前 return / 抛异常的路径
+                @SuppressWarnings("unchecked")
+                java.util.Set<Long> marked = (java.util.Set<Long>) req.getAttribute(IN_FLIGHT);
+                if (marked != null) {
+                    marked.forEach(IdleReaper::end);
+                }
+            }
             console.requestEnd(System.currentTimeMillis() - t0);
         }
     }
@@ -157,8 +202,59 @@ public class McpRequestFilter implements Filter {
         resp.getOutputStream().write(json.getBytes(StandardCharsets.UTF_8));
     }
 
-    /** 工具方法从 McpTransportContext 取当前请求凭据 */
+    /** 工具方法从 McpTransportContext 取当前请求凭据 (固定资源模式才有) */
     public static ConsoleClient.Resolved credential(McpTransportContext ctx) {
         return ctx == null ? null : (ConsoleClient.Resolved) ctx.get(CREDENTIAL);
+    }
+
+    /** 工具方法从 McpTransportContext 取可信用户身份 (用户自选模式才有) */
+    public static ConsoleClient.ResolvedUser userIdentity(McpTransportContext ctx) {
+        return ctx == null ? null : (ConsoleClient.ResolvedUser) ctx.get(USER_IDENTITY);
+    }
+
+    /** 工具方法从 McpTransportContext 取原始用户 Token (换取凭据用) */
+    public static String userToken(McpTransportContext ctx) {
+        return ctx == null ? null : (String) ctx.get(USER_TOKEN);
+    }
+
+    /** 本次请求解析出的凭据 (用户自选模式才有); 审计据此补资源, 不影响鉴权 */
+    @SuppressWarnings("unchecked")
+    public static ConsoleClient.Resolved resolved(McpTransportContext ctx) {
+        java.util.concurrent.atomic.AtomicReference<ConsoleClient.Resolved> ref = ctx == null
+                ? null : (java.util.concurrent.atomic.AtomicReference<ConsoleClient.Resolved>) ctx.get(RESOLVED);
+        return ref == null ? null : ref.get();
+    }
+
+    /** 工具层换取凭据后回填, 供审计补齐资源 */
+    @SuppressWarnings("unchecked")
+    public static void setResolved(McpTransportContext ctx, ConsoleClient.Resolved cred) {
+        java.util.concurrent.atomic.AtomicReference<ConsoleClient.Resolved> ref = ctx == null
+                ? null : (java.util.concurrent.atomic.AtomicReference<ConsoleClient.Resolved>) ctx.get(RESOLVED);
+        if (ref != null) {
+            ref.compareAndSet(null, cred);
+        }
+    }
+
+    /** 授权重校验被拒的原因 (用户自选模式才有) */
+    @SuppressWarnings("unchecked")
+    public static String denyReason(McpTransportContext ctx) {
+        java.util.concurrent.atomic.AtomicReference<String> ref = ctx == null
+                ? null : (java.util.concurrent.atomic.AtomicReference<String>) ctx.get(DENY_REASON);
+        return ref == null ? null : ref.get();
+    }
+
+    @SuppressWarnings("unchecked")
+    public static void setDenyReason(McpTransportContext ctx, String reason) {
+        java.util.concurrent.atomic.AtomicReference<String> ref = ctx == null
+                ? null : (java.util.concurrent.atomic.AtomicReference<String>) ctx.get(DENY_REASON);
+        if (ref != null) {
+            ref.compareAndSet(null, reason);
+        }
+    }
+
+    /** 本次请求的在途凭据集合 (用户自选模式才有) */
+    @SuppressWarnings("unchecked")
+    public static java.util.Set<Long> inFlight(McpTransportContext ctx) {
+        return ctx == null ? null : (java.util.Set<Long>) ctx.get(IN_FLIGHT);
     }
 }

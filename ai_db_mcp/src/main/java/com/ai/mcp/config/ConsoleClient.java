@@ -105,6 +105,15 @@ public class ConsoleClient {
     private record CachedResolved(Resolved value, long expireAt) {
     }
 
+    /** 用户自选模式的可信身份 (来自用户 Token 反查, 不是客户端自称的 X-User-Name) */
+    public record ResolvedUser(long agentId, long userId, String userName, String agentCode) {
+    }
+
+    /** 可用凭据清单项 (字段白名单: 绝不含密码与虚拟凭据, 内容会进入 LLM 上下文) */
+    public record CredentialItem(long credentialId, String name, String address, Integer port,
+                                 String username, String category, String dbType, String dbName) {
+    }
+
     /** 控制台明确拒绝 (code=403 + 中文原因) */
     public static class Rejected extends RuntimeException {
         public Rejected(String msg) {
@@ -410,6 +419,82 @@ public class ConsoleClient {
             resolveCache.put(key, new CachedResolved(r, now + ttl * 1000));
         }
         return r;
+    }
+
+    /**
+     * 解析用户身份 (用户自选模式的身份锚点)
+     * <p>
+     * 不缓存: 缓存会让 Token 重置/删除后仍有 TTL 窗口可用, 与"调用时实时判定"的口径矛盾
+     *
+     * @throws Rejected  控制台拒绝
+     * @throws Exception 控制台不可达
+     */
+    @SuppressWarnings("unchecked")
+    public ResolvedUser resolveUser(String agentCode, String userToken) throws Exception {
+        Map<String, Object> body = new java.util.HashMap<>();
+        body.put("agentCode", agentCode);
+        body.put("userToken", userToken);
+        Map<String, Object> d = (Map<String, Object>) checkedData(signedPost("/agent/gateway/opt/resolve-user", body));
+        return new ResolvedUser(
+                ((Number) d.get("agentId")).longValue(),
+                ((Number) d.get("userId")).longValue(),
+                (String) d.get("userName"),
+                agentCode);
+    }
+
+    /**
+     * 列出该用户可用凭据 (不含密码与虚拟凭据), 不缓存
+     */
+    @SuppressWarnings("unchecked")
+    public Map<String, Object> listCredentials(String agentCode, String userToken, String keyword) throws Exception {
+        Map<String, Object> body = new java.util.HashMap<>();
+        body.put("agentCode", agentCode);
+        body.put("userToken", userToken);
+        if (keyword != null && !keyword.isBlank()) {
+            body.put("keyword", keyword);
+        }
+        return (Map<String, Object>) checkedData(signedPost("/agent/gateway/opt/list-credentials", body));
+    }
+
+    /**
+     * 按 credentialId 换取真实凭据; 控制台会重新校验该凭据在此用户授权范围内, 不缓存
+     * <p>
+     * 建连与后续每次操作已有连接都调它: 撤权/过期/禁用即刻生效
+     */
+    @SuppressWarnings("unchecked")
+    public Resolved resolveCredential(String agentCode, String userToken, long credentialId, String userName) throws Exception {
+        Map<String, Object> body = new java.util.HashMap<>();
+        body.put("agentCode", agentCode);
+        body.put("userToken", userToken);
+        body.put("credentialId", credentialId);
+        Map<String, Object> d = (Map<String, Object>) checkedData(signedPost("/agent/gateway/opt/resolve-credential", body));
+        return new Resolved(
+                ((Number) d.get("agentId")).longValue(),
+                ((Number) d.get("credentialId")).longValue(),
+                (String) d.get("category"),
+                (String) d.get("dbType"),
+                (String) d.get("address"),
+                d.get("port") == null ? null : ((Number) d.get("port")).intValue(),
+                (String) d.get("dbName"),
+                (String) d.get("username"),
+                (String) d.get("password"),
+                agentCode,
+                userName);
+    }
+
+    /**
+     * 与 resolve 同款错误分流: 400/401/403 是控制台明确拒绝 (回 403), 其余属故障 (走 503)
+     */
+    private static Object checkedData(Map<String, Object> resp) {
+        if (!isOk(resp)) {
+            int code = resp != null && resp.get("code") instanceof Number ? ((Number) resp.get("code")).intValue() : -1;
+            if (code == 400 || code == 401 || code == 403) {
+                Object msg = resp.get("msg");
+                throw new Rejected(msg == null ? "控制台拒绝" : msg.toString());
+            }
+            throw new IllegalStateException("控制台响应异常 code=" + code);
+        }
+        return resp.get("data");
     }
 
     // -------------------- 供 Filter 调用 --------------------

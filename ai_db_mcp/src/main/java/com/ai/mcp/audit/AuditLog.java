@@ -82,6 +82,9 @@ public class AuditLog {
     public Map<String, Object> run(McpTransportContext ctx, String tool, String connectionId, String summary,
                                    Supplier<Map<String, Object>> call) {
         ConsoleClient.Resolved cred = McpRequestFilter.credential(ctx);
+        // 用户自选模式没有请求级凭据, 身份取 resolve-user 的可信结果 (审计不能因此丢智能体与用户)
+        ConsoleClient.ResolvedUser identity = McpRequestFilter.userIdentity(ctx);
+        McpTransportContext auditCtx = ctx;
         String srcIp = ctx == null ? null : (String) ctx.get(McpRequestFilter.SRC_IP);
         String userId = ctx == null ? null : (String) ctx.get(McpRequestFilter.USER_ID);
         long t0 = System.currentTimeMillis();
@@ -89,7 +92,7 @@ public class AuditLog {
         try {
             r = call.get();
         } catch (RuntimeException e) {
-            record(cred, srcIp, userId, tool, summary, t0, FAILED, e.toString(), connectionId, null, null);
+            record(pick(cred, auditCtx), identity, srcIp, userId, tool, summary, t0, FAILED, e.toString(), connectionId, null, null);
             throw e;
         }
         // SSH 命令: 工具协议里非零退出码仍 success=true, 审计按退出码判失败并保留 stderr
@@ -101,7 +104,7 @@ public class AuditLog {
                 : nonZero ? "exit=" + exit + (r.get("errorOutput") == null ? "" : " " + r.get("errorOutput"))
                 : String.valueOf(r.get("error"));
         Object[] res = resultOf(tool, r);
-        record(cred, srcIp, userId, tool, summary, t0, ok ? SUCCESS : FAILED, error, cid, (String) res[0], (Integer) res[1]);
+        record(pick(cred, auditCtx), identity, srcIp, userId, tool, summary, t0, ok ? SUCCESS : FAILED, error, cid, (String) res[0], (Integer) res[1]);
         return r;
     }
 
@@ -159,16 +162,30 @@ public class AuditLog {
         return s == null ? "" : s.replace('\r', ' ').replace('\n', ' ');
     }
 
-    private void record(ConsoleClient.Resolved cred, String srcIp, String userId, String tool, String summary, long t0,
+    /** 用户自选模式的凭据是工具层换来的, 调用结束时才有, 故审计取值放到最后 */
+    private static ConsoleClient.Resolved pick(ConsoleClient.Resolved cred, McpTransportContext ctx) {
+        return cred != null ? cred : McpRequestFilter.resolved(ctx);
+    }
+
+    /**
+     * 审计输入分两类: 调用身份 (智能体+用户) 与操作资源 (凭据+地址).
+     * 用户自选模式下 list_credentials 之类没有凭据, 但身份必须齐全, 否则审计链断一截
+     */
+    private void record(ConsoleClient.Resolved cred, ConsoleClient.ResolvedUser identity, String srcIp, String userId,
+                        String tool, String summary, long t0,
                         String status, String error, String cid, String result, Integer lines) {
         String s = summary == null ? "" : cut(summary, SUMMARY_MAX);
         error = error == null ? null : cut(error, ERROR_MAX);
         long cost = System.currentTimeMillis() - t0;
         String type = typeOf(tool, s);
-        add(new Entry(System.currentTimeMillis(), cred == null ? "-" : dash(cred.agentCode()), cred == null ? "-" : dash(cred.userName()),
+        String agentCode = cred != null ? cred.agentCode() : identity != null ? identity.agentCode() : null;
+        Long agentId = cred != null ? cred.agentId() : identity != null ? identity.agentId() : null;
+        String userName = cred != null ? cred.userName() : identity != null ? identity.userName() : null;
+        Long credentialId = cred == null ? null : cred.credentialId();
+        add(new Entry(System.currentTimeMillis(), dash(agentCode), dash(userName),
                 tool, type, resourceOf(cred), s, cost, status, error, cid));
-        spool(new Event(nextId(t0), cid, t0, cost, cred == null ? null : cred.agentId(), cred == null ? null : cred.agentCode(),
-                cred == null ? null : cred.credentialId(), cred == null ? null : cred.userName(), userId, srcIp,
+        spool(new Event(nextId(t0), cid, t0, cost, agentId, agentCode,
+                credentialId, userName, userId, srcIp,
                 tool, eventType(tool, s), status, s, result, lines, error));
     }
 
@@ -264,6 +281,10 @@ public class AuditLog {
     private static String resourceOf(ConsoleClient.Resolved c) {
         if (c == null) {
             return "-";
+        }
+        // 建连被拒时控制台没返回地址 (也不该由网关臆造), 用凭据 id 标出尝试访问的目标, 别拼成 "null"
+        if (c.address() == null || c.address().isBlank()) {
+            return c.credentialId() > 0 ? "cred#" + c.credentialId() : "-";
         }
         if ("DATABASE".equals(c.category())) {
             return c.address() + ":" + c.port() + (c.dbName() == null || c.dbName().isBlank() ? "" : "/" + c.dbName());
