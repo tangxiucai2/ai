@@ -184,10 +184,18 @@ public class AuditLog {
         Long credentialId = cred == null ? null : cred.credentialId();
         add(new Entry(System.currentTimeMillis(), dash(agentCode), dash(userName),
                 tool, type, resourceOf(cred), s, cost, status, error, cid));
+        // list_credentials 只是列出用户自己有权访问的凭据, 不碰任何资源, 不进审计日志;
+        // 节点内存环仍然保留 —— 那是节点运维视角, 和合规审计视角不是一回事
+        if (SKIP_SPOOL_TOOLS.contains(tool)) {
+            return;
+        }
         spool(new Event(nextId(t0), cid, t0, cost, agentId, agentCode,
                 credentialId, userName, userId, srcIp,
                 tool, eventType(tool, s), status, s, result, lines, error));
     }
+
+    /** 不上报控制台的工具: 没有资源访问行为, 记进审计日志只是噪音 */
+    private static final java.util.Set<String> SKIP_SPOOL_TOOLS = java.util.Set.of("list_credentials");
 
     /** 上报用类型码: connect / disconnect / command / SQL 动词 (SELECT/INSERT/...) */
     private static String eventType(String tool, String sql) {
