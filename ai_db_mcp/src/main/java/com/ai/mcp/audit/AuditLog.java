@@ -260,6 +260,7 @@ public class AuditLog {
             case "db_close_connection" -> "DB断开";
             case "db_execute_transaction" -> "SQL事务";
             case "db_execute" -> sqlType(summary);
+            case "list_credentials" -> "凭据查询";
             default -> tool;
         };
     }
