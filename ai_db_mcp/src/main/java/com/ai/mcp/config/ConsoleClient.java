@@ -29,6 +29,8 @@ import java.util.HexFormat;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Objects;
+import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentLinkedDeque;
 import java.util.concurrent.Executors;
@@ -86,6 +88,11 @@ public class ConsoleClient {
     // 节点事件回调 (AuditLog 启动时注入) 与按来源的去重键
     private volatile NodeAudit nodeAudit;
     private final Map<String, String> lastNodeEvent = new ConcurrentHashMap<>();
+    // 策略快照回调 (PolicyStore 启动时注入): 心跳是策略版本与可用性的唯一来源
+    private volatile PolicyHeartbeat policyHeartbeat;
+    /** 心跳已经上报过一次策略版本 (版本本身可以是 null, 见 notifyPolicy) */
+    private volatile boolean policyReported;
+    private volatile String lastPolicyVersion;
 
     // 身份解析缓存 key = agentCode\ntoken\nuserName; 访问序 LinkedHashMap, 超 1000 条淘汰最久未用; 拒绝不缓存
     private static final int RESOLVE_CACHE_MAX = 1000;
@@ -96,10 +103,15 @@ public class ConsoleClient {
         }
     };
 
-    /** 控制台解析出的连接信息 + 真实凭据 (只在内存, 不落盘不打日志) */
+    /**
+     * 控制台解析出的连接信息 + 真实凭据 (只在内存, 不落盘不打日志)
+     *
+     * @param dbType 资源主类型 (primaryType 推导), 同时就是访问控制策略的 hostType 口径
+     * @param hostId 目标资源 id, 策略按它定范围; 旧版控制台不下发时为 null → 不按策略放行
+     */
     public record Resolved(long agentId, long credentialId, String category, String dbType, String address,
                            Integer port, String dbName, String username, String password,
-                           String agentCode, String userName) {
+                           String agentCode, String userName, Long hostId) {
     }
 
     private record CachedResolved(Resolved value, long expireAt) {
@@ -123,6 +135,20 @@ public class ConsoleClient {
 
     // 指标
     private final AtomicInteger inflight = new AtomicInteger();
+    /** 活着的 MCP 会话数 (STREAMABLE 传输; 由 McpRequestFilter 记账) */
+    private final AtomicInteger sessions = new AtomicInteger();
+    /** 已记账的会话 id: 递减只认这里有的 (挡住"随机 id 反复 DELETE 把计数压到 0"的绕过) */
+    private final Set<String> countedSessions = ConcurrentHashMap.newKeySet();
+
+    /**
+     * STREAMABLE 会话数兜底上限 (固定值, 不配置)
+     * <p>
+     * 写死而不是做成配置项或表字段: 它是"别把网关内存吃光"的工程兜底, 不是对智能体的业务容量策略,
+     * 做成管理面配置反而让人以为需要调优。
+     * ponytail: 512 是拍脑袋的, 比正常并发高一个量级。它只防"炸"不防"漏" —— 会话没有空闲超时,
+     * 真填满了新客户端进不来, 只能重启。调这个值 = 改常量重新发版
+     */
+    static final int MAX_SESSIONS = 512;
     // 按日计数, 跨日切换与递增天然原子; 心跳时清掉旧日 key
     private final ConcurrentHashMap<LocalDate, LongAdder> daily = new ConcurrentHashMap<>();
     // [timestamp, costMs], 只保留最近 1 分钟
@@ -242,7 +268,14 @@ public class ConsoleClient {
                 "auditPending", auditPending.getAsLong(),
                 "auditDropped", auditDropped.getAsLong());
         long t0 = System.currentTimeMillis();
-        Map<String, Object> resp = signedPost("/agent/gateway/opt/report", body);
+        Map<String, Object> resp;
+        try {
+            resp = signedPost("/agent/gateway/opt/report", body);
+        } catch (Exception e) {
+            // 连不上也算心跳失败: 否则策略快照会在控制台离线期间被无限期沿用
+            failPolicy();
+            throw e;
+        }
         consoleRttMs = System.currentTimeMillis() - t0;
         if (!isOk(resp)) {
             // 403: 节点被禁用/密钥被重置/已删除 → fail-closed
@@ -251,14 +284,71 @@ public class ConsoleClient {
                 log.warn("ConsoleClient 心跳被拒, /mcp 进入 503: {}", resp == null ? null : resp.get("msg"));
             }
             enabled = false;
+            failPolicy();
             return;
         }
-        applyAuth((Map<String, Object>) resp.get("data"));
+        try {
+            Map<String, Object> data = (Map<String, Object>) resp.get("data");
+            applyAuth(data);
+            // 必须在 enabled 之前: 拉完快照才放行, 否则「/mcp 已放行但策略还没到」有个窗口期
+            notifyPolicy((String) data.get("policyVersion"));
+        } catch (Exception e) {
+            // 响应结构不对 (data 不是对象 / policyVersion 不是字符串) 也要算心跳失败:
+            // 否则它走的是"成功"这条路, fails 永不增加 → 旧策略被无限期沿用, "连失 3 次即全拒"形同虚设
+            failPolicy();
+            throw e;
+        }
         nodeEvent(SRC_CONSOLE, AuditLog.SUCCESS, "心跳正常, /mcp 放行");
         if (!enabled) {
             log.info("ConsoleClient 心跳正常, /mcp 放行");
         }
         enabled = true;
+    }
+
+    /** 策略快照版本下发回调 */
+    public interface PolicyHeartbeat {
+        /** @param version 控制台下发的策略版本; null 表示控制台未配置策略版本 (旧版控制台) */
+        void onReport(String version);
+
+        /** 心跳失败 (不可达 / 被拒) */
+        void onFail();
+    }
+
+    public void policyHeartbeat(PolicyHeartbeat h) {
+        this.policyHeartbeat = h;
+        // 补发: 心跳是 start() 里异步起的, 首轮完全可能在这个监听器注册之前就跑完 ——
+        // 不补的话要再等一个心跳周期, 而这期间策略是 loaded=false, 所有 HOST 命令(包括本该放行的
+        // 无策略智能体)都会判「策略源不可用」被拒. 同版本补发是幂等的, 不会多拉一次快照
+        if (policyReported) {
+            h.onReport(lastPolicyVersion);
+        }
+    }
+
+    private void notifyPolicy(String version) {
+        lastPolicyVersion = version;
+        policyReported = true;
+        PolicyHeartbeat h = policyHeartbeat;
+        if (h != null) {
+            h.onReport(version);
+        }
+    }
+
+    private void failPolicy() {
+        PolicyHeartbeat h = policyHeartbeat;
+        if (h != null) {
+            h.onFail();
+        }
+    }
+
+    /**
+     * 拉取该节点的启用策略快照 (控制台已把 rules 摊平成 ops)
+     *
+     * @throws Rejected  控制台明确拒绝
+     * @throws Exception 控制台不可达
+     */
+    @SuppressWarnings("unchecked")
+    public Map<String, Object> policySnapshot() throws Exception {
+        return (Map<String, Object>) checkedData(signedPost("/agent/gateway/opt/policy-snapshot", Map.of()));
     }
 
     private void applyAuth(Map<String, Object> data) {
@@ -413,7 +503,8 @@ public class ConsoleClient {
                 (String) d.get("username"),
                 (String) d.get("password"),
                 agentCode,
-                userName);
+                userName,
+                d.get("hostId") == null ? null : ((Number) d.get("hostId")).longValue());
         long ttl = d.get("ttlSeconds") == null ? 60 : ((Number) d.get("ttlSeconds")).longValue();
         synchronized (resolveCache) {
             resolveCache.put(key, new CachedResolved(r, now + ttl * 1000));
@@ -479,7 +570,8 @@ public class ConsoleClient {
                 (String) d.get("username"),
                 (String) d.get("password"),
                 agentCode,
-                userName);
+                userName,
+                d.get("hostId") == null ? null : ((Number) d.get("hostId")).longValue());
     }
 
     /**
@@ -551,6 +643,85 @@ public class ConsoleClient {
     public void requestEnd(long costMs) {
         inflight.decrementAndGet();
         samples.addLast(new long[]{System.currentTimeMillis(), costMs});
+    }
+
+    /**
+     * 新建了一个 MCP 会话 (initialize 成功)
+     * <p>
+     * STREAMABLE 的会话只在客户端发 DELETE 时被回收 —— SDK 0.18.2 既没有空闲超时也没有数量上限
+     * (整个 provider 里 {@code sessions.remove} 只出现在 {@code handleDelete})。客户端崩溃、断网、
+     * 直接重连都不会发 DELETE, 每次都留下一条, 所以必须自己记账 + {@link #sessionLimitReached()} 兜底。
+     * 别用开 keep-alive 来"解决": 本版本的 KeepAliveScheduler 失败只打日志、不驱逐, 会把内存问题换成
+     * CPU/线程池问题 (上游 issue #1022, 驱逐逻辑在后续 PR #1028 才加)
+     */
+    public void sessionOpened(String sessionId) {
+        if (sessionId == null) {
+            return;
+        }
+        if (countedSessions.add(sessionId)) {
+            sessions.incrementAndGet();
+        }
+    }
+
+    /**
+     * 客户端 DELETE 回收了一个会话
+     * <p>
+     * <b>只对真建过的会话 id 递减</b>: 拿随机 id 反复 DELETE 就能把计数压到 0,
+     * 再随便建会话 —— 上限等于不存在 (绕过兜底的现成办法)
+     */
+    public void sessionClosed(String sessionId) {
+        if (sessionId != null && countedSessions.remove(sessionId)) {
+            sessions.updateAndGet(n -> n > 0 ? n - 1 : 0);
+        }
+    }
+
+    /**
+     * 一次请求结束后的会话记账
+     * <p>
+     * 判据只能是头: initialize 的响应带着新会话 id 而请求里没有该头; DELETE 按方法判 (它的响应不带会话头)。
+     * 建过哪些 id 记在 {@code countedSessions} 里, 递减必须对得上号。
+     *
+     * @param status DELETE 的响应码: 只有真删成功才还额度 —— 传输层回 405/500/404 时那条会话还在
+     *               SDK 的表里 (例如配了 disallow-delete), 客户可以"建一个再发一个必然失败的 DELETE"
+     *               循环, 把额度刷回来把上限变成摆设
+     */
+    public void accountSession(String method, String requestSessionId, String responseSessionId, int status) {
+        if ("DELETE".equalsIgnoreCase(method)) {
+            if (status >= 200 && status < 300) {
+                sessionClosed(requestSessionId);
+            }
+        } else if (!Objects.equals(requestSessionId, responseSessionId)) {
+            // 响应里的会话 id 和请求里的不一样 (或请求没带) → SDK 这次建了新会话.
+            // 不能只看"请求没带 id": 客户端在 initialize 上塞一个任意/过期的 id 时 SDK 照样新建,
+            // 判据写成"请求没带 id"就漏计了那一条, 上限被绕过
+            sessionOpened(responseSessionId);
+        }
+    }
+
+    /**
+     * 这个请求有没有可能新建会话 —— 上限预检用
+     * <p>
+     * <b>不能按"带的会话 id 是否已知"来豁免</b>: SDK 判断"这是不是 initialize"看的是请求体里的
+     * JSON-RPC method 字段, 跟 Mcp-Session-Id 头完全无关 —— initialize 请求上哪怕带一个已经在用的
+     * 真实 id, SDK 照样无视它、新建一个会话 (v0.18.2 WebMvcStreamableServerTransportProvider#handlePost:
+     * 先判 method=="initialize" 才看头). 按"已知 id 就不算新建"来放过预检, 攻击者反复带着第一次拿到
+     * 的合法 id 发 initialize 就能绕过 512 上限, 且门槛比"带假 id"更低——真实 id 唾手可得。
+     * 要精确识别只能解析请求体 (在 Filter 里包一层可重读的 request), 收益(达到上限那个窄窗口里
+     * 少拒几个在飞调用)配不上这个复杂度: 512 本来就是"填满了只能重启"的应急阈值, 顺带多拒
+     * 几个在飞调用可以接受, 所以只按方法判, 不再看会话 id
+     */
+    public boolean mayCreateSession(String method) {
+        return "POST".equalsIgnoreCase(method);
+    }
+
+    /** 会话数是否已达上限 */
+    public boolean sessionLimitReached() {
+        return sessions.get() >= MAX_SESSIONS;
+    }
+
+    /** 当前会话数 (恢复靠重启: 没有别的回收路径) */
+    public int sessionCount() {
+        return sessions.get();
     }
 
     // -------------------- 指标 --------------------

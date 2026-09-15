@@ -3,8 +3,8 @@ package com.ai.mcp.config;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import io.modelcontextprotocol.common.McpTransportContext;
 import io.modelcontextprotocol.json.jackson.JacksonMcpJsonMapper;
-import io.modelcontextprotocol.server.transport.WebMvcStatelessServerTransport;
-import org.springframework.beans.factory.annotation.Value;
+import io.modelcontextprotocol.server.transport.WebMvcStreamableServerTransportProvider;
+import org.springframework.ai.mcp.server.common.autoconfigure.properties.McpServerStreamableHttpProperties;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
 
@@ -12,17 +12,21 @@ import java.util.HashMap;
 import java.util.Map;
 
 /**
- * 覆盖自动配置的 STATELESS 传输: 自动配置的 contextExtractor 恒为 EMPTY, 这里把 Filter 解析出的凭据带进 McpTransportContext
+ * 覆盖自动配置的 STREAMABLE 传输: 自动配置的 contextExtractor 恒为 EMPTY, 这里把 Filter 解析出的凭据带进 McpTransportContext
+ * <p>
+ * 必须是 streamable 而不是 stateless: 协议级二次确认 (elicitation) 挂在会话对象上, stateless 的工具回调拿不到 exchange
  */
 @Configuration
 public class McpTransportConfig {
 
     @Bean
-    public WebMvcStatelessServerTransport webMvcStatelessServerTransport(ObjectMapper objectMapper,
-            @Value("${spring.ai.mcp.server.streamable-http.mcp-endpoint:/mcp}") String mcpEndpoint) {
-        return WebMvcStatelessServerTransport.builder()
+    public WebMvcStreamableServerTransportProvider webMvcStreamableServerTransportProvider(
+            ObjectMapper objectMapper, McpServerStreamableHttpProperties props) {
+        return WebMvcStreamableServerTransportProvider.builder()
                 .jsonMapper(new JacksonMcpJsonMapper(objectMapper))
-                .messageEndpoint(mcpEndpoint)
+                .mcpEndpoint(props.getMcpEndpoint())
+                .keepAliveInterval(props.getKeepAliveInterval())
+                .disallowDelete(props.isDisallowDelete())
                 .contextExtractor(req -> {
                     Map<String, Object> ctx = new HashMap<>();
                     for (String k : new String[]{McpRequestFilter.CREDENTIAL, McpRequestFilter.USER_IDENTITY,

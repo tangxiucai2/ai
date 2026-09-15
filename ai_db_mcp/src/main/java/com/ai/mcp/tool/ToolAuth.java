@@ -87,7 +87,8 @@ public class ToolAuth {
                 meta.agentId(), meta.credentialId(), null, null, meta.resource(),
                 null, null, null, null,
                 identity == null ? null : identity.agentCode(),
-                identity == null ? null : identity.userName()));
+                identity == null ? null : identity.userName(),
+                null));
     }
 
     /**
@@ -126,7 +127,7 @@ public class ToolAuth {
     private static void attempted(McpTransportContext ctx, ConsoleClient.ResolvedUser identity, long credentialId) {
         McpRequestFilter.setResolved(ctx, new ConsoleClient.Resolved(
                 identity.agentId(), credentialId, null, null, null,
-                null, null, null, null, identity.agentCode(), identity.userName()));
+                null, null, null, null, identity.agentCode(), identity.userName(), null));
     }
 
     /**

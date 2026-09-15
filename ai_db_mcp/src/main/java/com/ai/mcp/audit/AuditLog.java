@@ -98,13 +98,17 @@ public class AuditLog {
         // SSH 命令: 工具协议里非零退出码仍 success=true, 审计按退出码判失败并保留 stderr
         Object exit = r == null ? null : r.get("exitCode");
         boolean nonZero = exit instanceof Integer && (Integer) exit != 0;
+        // 策略闸门拒绝的调用根本没执行, 不能跟"执行了但失败"混进同一个 FAILED —— 会让访问控制的
+        // 拒绝统计和真实故障率互相污染. 标记由 SshTool 在 policyDeny() 命中时打上, 这里读完即摘掉,
+        // 不让这个内部字段泄漏进返回给客户端的结果
+        boolean denied = r != null && Boolean.TRUE.equals(r.remove("denied"));
         boolean ok = r != null && Boolean.TRUE.equals(r.get("success")) && !nonZero;
         String cid = connectionId != null || r == null ? connectionId : (String) r.get("connectionId");
         String error = ok || r == null ? null
                 : nonZero ? "exit=" + exit + (r.get("errorOutput") == null ? "" : " " + r.get("errorOutput"))
                 : String.valueOf(r.get("error"));
         Object[] res = resultOf(tool, r);
-        record(pick(cred, auditCtx), identity, srcIp, userId, tool, summary, t0, ok ? SUCCESS : FAILED, error, cid, (String) res[0], (Integer) res[1]);
+        record(pick(cred, auditCtx), identity, srcIp, userId, tool, summary, t0, ok ? SUCCESS : denied ? DENIED : FAILED, error, cid, (String) res[0], (Integer) res[1]);
         return r;
     }
 

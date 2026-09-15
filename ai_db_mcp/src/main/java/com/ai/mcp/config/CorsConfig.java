@@ -20,6 +20,9 @@ public class CorsConfig {
         config.setAllowedOriginPatterns(Arrays.asList("*"));
         config.setAllowedMethods(Arrays.asList("GET", "POST", "PUT", "DELETE", "OPTIONS"));
         config.setAllowedHeaders(Arrays.asList("*"));
+        // STREAMABLE 下客户端要从初始化响应里读会话 id, 后续请求都带着它.
+        // 响应头默认不暴露给跨域 JS, 不显式暴露的话浏览器客户端读到的会话 id 是 null, 初始化后寸步难行
+        config.setExposedHeaders(Arrays.asList("Mcp-Session-Id"));
         config.setAllowCredentials(true);
         config.setMaxAge(3600L);
 

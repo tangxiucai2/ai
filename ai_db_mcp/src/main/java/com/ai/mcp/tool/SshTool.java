@@ -3,8 +3,11 @@ package com.ai.mcp.tool;
 import com.ai.mcp.audit.AuditLog;
 import com.ai.mcp.config.ConsoleClient;
 import com.ai.mcp.config.McpRequestFilter;
+import com.ai.mcp.policy.PolicyDecider;
+import com.ai.mcp.policy.PolicyGate;
 import com.jcraft.jsch.*;
 import io.modelcontextprotocol.common.McpTransportContext;
+import io.modelcontextprotocol.server.McpSyncServerExchange;
 import org.springaicommunity.mcp.annotation.McpTool;
 import org.springaicommunity.mcp.annotation.McpToolParam;
 import org.springframework.stereotype.Component;
@@ -23,12 +26,14 @@ import java.util.concurrent.ConcurrentHashMap;
 public class SshTool {
 
     private final AuditLog audit;
+    private final PolicyGate gate;
     private final Map<String, Conn<Session>> sessions = new ConcurrentHashMap<>();
     private final IdleReaper<Session> reaper = new IdleReaper<>("ssh-idle-reaper", sessions, Session::disconnect);
     private final Map<String, ChannelExec> activeChannels = new ConcurrentHashMap<>();
 
-    public SshTool(AuditLog audit) {
+    public SshTool(AuditLog audit, PolicyGate gate) {
         this.audit = audit;
+        this.gate = gate;
     }
 
     @McpTool(name = "ssh_connect", description = "Create a new SSH connection. "
@@ -160,6 +165,50 @@ public class SshTool {
     }
 
     /**
+     * 策略拒绝的对外理由, 带上命中策略的标签
+     * <p>
+     * 这个串就是审计里的 error: 只写"命中黑名单"看不出是哪条策略拦的, 事后没法对上控制台列表
+     */
+    private static String policyReason(PolicyDecider.Decision decision) {
+        String label = decision.policyLabel();
+        return label == null ? decision.reason() : decision.reason() + " [策略: " + label + "]";
+    }
+
+    /**
+     * 策略判定 → 拒绝原因; 通过返回 null
+     * <p>
+     * 等过人工确认的判定要再校验一次: 确认最长阻塞 120 秒, 期间凭据可能被撤销/过期。
+     * <b>但真正回控制台重校验的只有用户自选模式</b> —— 固定资源模式在 {@link ToolAuth#verdict} 里直接返回
+     * 放行 (阶段二既定口径: 身份本就不可信, 每次操作都回控制台既改变存量行为又白付性能), 那种模式下
+     * 这里只剩「句柄还在 + 本地归属匹配」, 与 lookup 开头那次等价, 不构成额外的撤权保护。
+     * 没等确认的路径不重复校验 —— lookup 刚刚校验过, 再来一次是白付一次控制台往返
+     */
+    private String policyDeny(PolicyDecider.Decision decision, String connectionId, McpTransportContext ctx) {
+        if (decision.kind() != PolicyDecider.Kind.ALLOW) {
+            return policyReason(decision);
+        }
+        if (decision.confirmWaited() && !stillAuthorized(connectionId, ctx)) {
+            return notFound(connectionId, ctx);
+        }
+        // 限流配额不在这里记: 这一步只是"策略放行", openChannel/setCommand/connect 还可能失败
+        // (远端拒绝新通道、网络抖动…), 那种情况下命令根本没跑起来。调用方在 channel.connect()
+        // 真正成功之后才调 gate.recordRate(ctx) —— 提前记账会让一次瞬时通道故障消耗掉配额,
+        // 在低配额策略下把后面正常的调用也拖进同一个窗口里被拒, 违背"被拒/没执行的调用不占配额"
+        return null;
+    }
+
+    /**
+     * 授权是否仍然有效 (确认等待后的复检)
+     * <p>
+     * 用户自选模式回控制台按连接元数据里的 credentialId 重校验, 控制台不可达同样判为否;
+     * 固定资源模式不重校验 (见 {@link ToolAuth#verdict}), 这里相当于只确认句柄与归属还在
+     */
+    private boolean stillAuthorized(String connectionId, McpTransportContext ctx) {
+        Conn<Session> conn = reaper.peek(connectionId);
+        return conn != null && conn.meta().accessibleBy(ctx) && ToolAuth.recheck(ctx, conn.meta());
+    }
+
+    /**
      * 归属校验: 先比本地四元组 (模式/智能体/用户), 用户模式再回控制台按连接元数据里的 credentialId 重校验授权
      * <p>
      * 只比前缀是不够的: 老模式持同一 credentialId 的虚拟凭据会摸到用户模式建的连接
@@ -271,48 +320,65 @@ public class SshTool {
     @McpTool(name = "ssh_execute", description = "Execute a command on the remote host (supports continuous output)")
     public Map<String, Object> ssh_execute(
             @McpToolParam(description = "Connection ID") String connectionId,
-            @McpToolParam(description = "Command to execute") String command, McpTransportContext ctx) {
-        return audit.run(ctx, "ssh_execute", connectionId, command, () -> ssh_execute0(connectionId, command, ctx));
+            @McpToolParam(description = "Command to execute") String command, McpTransportContext ctx,
+            McpSyncServerExchange exchange) {
+        return audit.run(ctx, "ssh_execute", connectionId, command, () -> ssh_execute0(connectionId, command, ctx, exchange));
     }
 
-        private Map<String, Object> ssh_execute0(String connectionId, String command, McpTransportContext ctx) {
-        
+        private Map<String, Object> ssh_execute0(String connectionId, String command, McpTransportContext ctx,
+                                                 McpSyncServerExchange exchange) {
+
         Map<String, Object> result = new HashMap<>();
-        
+
         Session session = lookup(connectionId, ctx);
         if (session == null) {
             result.put("success", false);
             result.put("error", notFound(connectionId, ctx));
             return result;
         }
-        
+
+        // 连接状态检查放在策略闸门之前 (与 long_running 版本同序): 已断开的连接注定执行不了,
+        // 先弹窗等 120 秒确认再发现连不上, 白占一个确认线程池名额
         if (!session.isConnected()) {
             result.put("success", false);
             result.put("error", "Connection is not active: " + connectionId);
             sessions.remove(connectionId);
             return result;
         }
-        
+
+        // 策略闸门在 lookup 之后: 用户自选模式的凭据(含 hostId)是 lookup 重校验时才拿到的
+        String denied = policyDeny(gate.check(ctx, exchange, command), connectionId, ctx);
+        if (denied != null) {
+            result.put("success", false);
+            result.put("error", denied);
+            // 供 AuditLog 区分"策略拒绝"与"执行失败", 该字段在审计记录后会被摘掉不外传
+            result.put("denied", true);
+            return result;
+        }
+
         ChannelExec channel = null;
-        
+
         try {
             channel = (ChannelExec) session.openChannel("exec");
             channel.setCommand(command);
-            
+
             InputStream in = channel.getInputStream();
             InputStream err = channel.getErrStream();
-            
+
             channel.connect(10000);
-            
+            // 到这里通道真的建起来了、命令已经发给远端执行 —— 限流配额记在此刻,
+            // 不记在 policyDeny() 放行的那一刻 (openChannel/setCommand/connect 都可能失败)
+            gate.recordRate(ctx);
+
             StringBuilder output = new StringBuilder();
             StringBuilder error = new StringBuilder();
-            
+
             BufferedReader reader = new BufferedReader(new InputStreamReader(in));
             BufferedReader errReader = new BufferedReader(new InputStreamReader(err));
-            
+
             long startTime = System.currentTimeMillis();
             long timeout = 60000;
-            
+
             char[] buffer = new char[1024];
             int len;
             
@@ -385,45 +451,60 @@ public class SshTool {
     public Map<String, Object> ssh_execute_long_running(
             @McpToolParam(description = "Connection ID") String connectionId,
             @McpToolParam(description = "Command to execute") String command,
-            @McpToolParam(description = "Timeout in milliseconds (0 for no timeout)") Long timeout, McpTransportContext ctx) {
-        return audit.run(ctx, "ssh_execute_long_running", connectionId, command, () -> ssh_execute_long_running0(connectionId, command, timeout, ctx));
+            @McpToolParam(description = "Timeout in milliseconds (0 for no timeout)") Long timeout, McpTransportContext ctx,
+            McpSyncServerExchange exchange) {
+        return audit.run(ctx, "ssh_execute_long_running", connectionId, command, () -> ssh_execute_long_running0(connectionId, command, timeout, ctx, exchange));
     }
 
-        private Map<String, Object> ssh_execute_long_running0(String connectionId, String command, Long timeout, McpTransportContext ctx) {
-        
+        private Map<String, Object> ssh_execute_long_running0(String connectionId, String command, Long timeout, McpTransportContext ctx,
+                                                             McpSyncServerExchange exchange) {
+
         Map<String, Object> result = new HashMap<>();
-        
+
         Session session = lookup(connectionId, ctx);
         if (session == null) {
             result.put("success", false);
             result.put("error", notFound(connectionId, ctx));
             return result;
         }
-        
+
         if (!session.isConnected()) {
             result.put("success", false);
             result.put("error", "Connection is not active: " + connectionId);
             sessions.remove(connectionId);
             return result;
         }
-        
+
+        // 策略闸门在 lookup 之后: 用户自选模式的凭据(含 hostId)是 lookup 重校验时才拿到的
+        String denied = policyDeny(gate.check(ctx, exchange, command), connectionId, ctx);
+        if (denied != null) {
+            result.put("success", false);
+            result.put("error", denied);
+            // 供 AuditLog 区分"策略拒绝"与"执行失败", 该字段在审计记录后会被摘掉不外传
+            result.put("denied", true);
+            return result;
+        }
+
         ChannelExec channel = null;
-        
+
         try {
             channel = (ChannelExec) session.openChannel("exec");
             channel.setCommand(command);
-            
+
             InputStream in = channel.getInputStream();
             InputStream err = channel.getErrStream();
-            
+
             channel.connect(10000);
-            
+            // 到这里通道真的建起来了、命令已经发给远端执行 —— 限流配额记在此刻,
+            // 不记在 policyDeny() 放行的那一刻 (openChannel/setCommand/connect 都可能失败)
+            gate.recordRate(ctx);
+
             StringBuilder output = new StringBuilder();
             StringBuilder error = new StringBuilder();
-            
+
             BufferedReader reader = new BufferedReader(new InputStreamReader(in));
             BufferedReader errReader = new BufferedReader(new InputStreamReader(err));
-            
+
             long startTime = System.currentTimeMillis();
             boolean timeoutOccurred = false;
             

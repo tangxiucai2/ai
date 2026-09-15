@@ -43,3 +43,6 @@ out/
 
 .deploy.env
 deploy.sh
+
+# ai_db_mcp 本地跑 jar 时 AuditLog/AuditSpool 落盘目录, 含真实审计数据
+ai_db_mcp/data/

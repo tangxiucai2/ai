@@ -48,6 +48,9 @@ public class McpRequestFilter implements Filter {
     /** 429 无 Servlet 常量 */
     private static final int SC_TOO_MANY_REQUESTS = 429;
 
+    /** streamable 会话 id 的头名 (MCP 规范固定), 请求与响应都用它 */
+    private static final String SESSION_ID = "Mcp-Session-Id";
+
     private final ConsoleClient console;
     private final AuditLog audit;
     // 与传输层共用端点配置, 避免改了 mcp-endpoint 后鉴权仍只盯 /mcp
@@ -106,6 +109,21 @@ public class McpRequestFilter implements Filter {
             } else {
                 reject(resp, SC_TOO_MANY_REQUESTS, "超过 QPS 限制");
             }
+            return;
+        }
+        // 会话数兜底闸门: STREAMABLE 的会话只在客户端 DELETE 时回收 (SDK 0.18.2 无空闲超时/无上限),
+        // 泄漏只增不减 → 这里给个天花板, 免得一个失控客户端把网关内存吃光 (网关一挂, 所有智能体都不能执行).
+        // 它只防"炸"不防"漏": 真填满了新客户端就进不来, 只能重启 —— 所以阈值要比正常并发高一个量级.
+        // mayCreateSession 只按方法判 (POST 才可能), 不再按会话 id 精细放行:
+        // SDK 判"是不是 initialize"只看请求体里的 method 字段, 跟头里的会话 id 无关, 按 id 放行就是
+        // 给绕过开后门 (见 ConsoleClient#mayCreateSession 的详细说明). 代价是一旦真的顶到上限,
+        // 已有会话的后续调用也会跟着被拒 —— 这本来就是"填满了只能重启"的应急态, 可以接受.
+        // ponytail: 检查在这里、计数在请求结束时做, 并发 POST 会一起越过检查, 超额量以"同时在飞的
+        // POST 数"为上限 (受线程池约束)。要精确就得上预占+归还, 那条路径漏还一次就永久少一份额度,
+        // 比多几条会话更糟 —— 兜底值不值得那个; 真要精确, 先换掉没有回收的传输实现
+        if (console.mayCreateSession(req.getMethod()) && console.sessionLimitReached()) {
+            deny(resp, HttpServletResponse.SC_SERVICE_UNAVAILABLE, "节点会话数已达上限, 请稍后重试",
+                    agentCode, userName, srcIp, userId);
             return;
         }
         // 智能体身份: Header 优先, Query 兜底 (客户端不支持自定义头的场景)
@@ -169,6 +187,8 @@ public class McpRequestFilter implements Filter {
                 }
             }
             console.requestEnd(System.currentTimeMillis() - t0);
+            console.accountSession(req.getMethod(), req.getHeader(SESSION_ID), resp.getHeader(SESSION_ID),
+                    resp.getStatus());
         }
     }
 
