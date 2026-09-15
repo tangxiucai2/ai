@@ -2,6 +2,7 @@ package com.ai.mcp.audit;
 
 import com.ai.mcp.config.ConsoleClient;
 import com.ai.mcp.config.McpRequestFilter;
+import com.ai.mcp.policy.PolicyDecider;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import io.modelcontextprotocol.common.McpTransportContext;
 import jakarta.annotation.PostConstruct;
@@ -73,7 +74,7 @@ public class AuditLog {
     /** 上报控制台的事件 (比 Entry 多身份/结果字段) */
     private record Event(String id, String connectionId, long time, long costMs, Long agentId, String agentCode, Long credentialId,
                          String userName, String userId, String srcIp, String tool, String type, String status,
-                         String summary, String result, Integer lines, String error) {
+                         String denySource, String summary, String result, Integer lines, String error) {
     }
 
     /**
@@ -92,23 +93,25 @@ public class AuditLog {
         try {
             r = call.get();
         } catch (RuntimeException e) {
-            record(pick(cred, auditCtx), identity, srcIp, userId, tool, summary, t0, FAILED, e.toString(), connectionId, null, null);
+            record(pick(cred, auditCtx), identity, srcIp, userId, tool, summary, t0, FAILED, null, e.toString(), connectionId, null, null);
             throw e;
         }
         // SSH 命令: 工具协议里非零退出码仍 success=true, 审计按退出码判失败并保留 stderr
         Object exit = r == null ? null : r.get("exitCode");
         boolean nonZero = exit instanceof Integer && (Integer) exit != 0;
         // 策略闸门拒绝的调用根本没执行, 不能跟"执行了但失败"混进同一个 FAILED —— 会让访问控制的
-        // 拒绝统计和真实故障率互相污染. 标记由 SshTool 在 policyDeny() 命中时打上, 这里读完即摘掉,
-        // 不让这个内部字段泄漏进返回给客户端的结果
-        boolean denied = r != null && Boolean.TRUE.equals(r.remove("denied"));
+        // 拒绝统计和真实故障率互相污染. 来源由 SshTool 在 policyDeny() 命中时打上 (POLICY/CONFIRM/AUTH),
+        // 控制台据此把「策略拒绝」与「人工拒绝」分开; 这里读完即摘掉, 不让内部字段泄漏给客户端
+        String denySource = r == null ? null : (String) r.remove("denySource");
+        boolean denied = denySource != null;
         boolean ok = r != null && Boolean.TRUE.equals(r.get("success")) && !nonZero;
         String cid = connectionId != null || r == null ? connectionId : (String) r.get("connectionId");
         String error = ok || r == null ? null
                 : nonZero ? "exit=" + exit + (r.get("errorOutput") == null ? "" : " " + r.get("errorOutput"))
                 : String.valueOf(r.get("error"));
         Object[] res = resultOf(tool, r);
-        record(pick(cred, auditCtx), identity, srcIp, userId, tool, summary, t0, ok ? SUCCESS : denied ? DENIED : FAILED, error, cid, (String) res[0], (Integer) res[1]);
+        record(pick(cred, auditCtx), identity, srcIp, userId, tool, summary, t0, ok ? SUCCESS : denied ? DENIED : FAILED,
+                denySource, error, cid, (String) res[0], (Integer) res[1]);
         return r;
     }
 
@@ -116,7 +119,8 @@ public class AuditLog {
     public void denied(String agent, String user, String reason, String srcIp, String userId) {
         long now = System.currentTimeMillis();
         add(new Entry(now, line(dash(agent)), line(dash(user)), "auth", "鉴权", "-", reason, 0, DENIED, reason, null));
-        spool(new Event(nextId(now), null, now, 0, null, agent, null, user, userId, srcIp, "auth", "denied", DENIED, reason, null, null, reason));
+        spool(new Event(nextId(now), null, now, 0, null, agent, null, user, userId, srcIp, "auth", "denied", DENIED,
+                PolicyDecider.Source.AUTH.name(), reason, null, null, reason));
     }
 
     /** 工具返回值 → 结果摘要 + 行数: SSH 取 stdout 前 2000 字与行数; SQL 查询取行数/列; 更新取影响行数; 事务取语句数/影响行数 */
@@ -177,7 +181,7 @@ public class AuditLog {
      */
     private void record(ConsoleClient.Resolved cred, ConsoleClient.ResolvedUser identity, String srcIp, String userId,
                         String tool, String summary, long t0,
-                        String status, String error, String cid, String result, Integer lines) {
+                        String status, String denySource, String error, String cid, String result, Integer lines) {
         String s = summary == null ? "" : cut(summary, SUMMARY_MAX);
         error = error == null ? null : cut(error, ERROR_MAX);
         long cost = System.currentTimeMillis() - t0;
@@ -195,7 +199,7 @@ public class AuditLog {
         }
         spool(new Event(nextId(t0), cid, t0, cost, agentId, agentCode,
                 credentialId, userName, userId, srcIp,
-                tool, eventType(tool, s), status, s, result, lines, error));
+                tool, eventType(tool, s), status, denySource, s, result, lines, error));
     }
 
     /** 不上报控制台的工具: 没有资源访问行为, 记进审计日志只是噪音 */

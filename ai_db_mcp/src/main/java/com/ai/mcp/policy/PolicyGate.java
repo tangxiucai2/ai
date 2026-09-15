@@ -72,7 +72,7 @@ public class PolicyGate {
     public Decision check(McpTransportContext ctx, McpSyncServerExchange exchange, String command) {
         ConsoleClient.Resolved cred = credential(ctx);
         if (cred == null) {
-            return Decision.of(Kind.DENY, "无法确定调用身份, 不能放行命令", null);
+            return Decision.auth(Kind.DENY, "无法确定调用身份, 不能放行命令");
         }
         Decision decision = decider.decide(cred.agentId(), cred.dbType(), cred.hostId(), command);
         if (decision.kind() != Kind.CONFIRM) {
@@ -115,14 +115,14 @@ public class PolicyGate {
 
     private Decision confirm(McpSyncServerExchange exchange, String command, Decision decision) {
         if (exchange == null || !supportsElicitation(exchange)) {
-            return Decision.of(Kind.DENY, "该客户端不支持人工二次确认, 已拒绝执行", decision.policyLabel());
+            return Decision.confirm(Kind.DENY, "该客户端不支持人工二次确认, 已拒绝执行", decision.policyLabel());
         }
         McpSchema.ElicitResult result;
         Future<McpSchema.ElicitResult> future;
         try {
             future = CONFIRM_POOL.submit(() -> exchange.createElicitation(request(command, decision.policyLabel())));
         } catch (Exception e) {
-            return Decision.of(Kind.DENY, "二次确认通道繁忙, 已拒绝执行", decision.policyLabel());
+            return Decision.confirm(Kind.DENY, "二次确认通道繁忙, 已拒绝执行", decision.policyLabel());
         }
         try {
             result = future.get(CONFIRM_TIMEOUT_SEC, TimeUnit.SECONDS);
@@ -130,13 +130,13 @@ public class PolicyGate {
             // 超时: 撤掉等待, 但底层请求可能仍挂在客户端 — 由会话关闭或客户端作答回收
             future.cancel(true);
             log.info("二次确认超时 policy={} command={}", decision.policyLabel(), command);
-            return Decision.of(Kind.DENY, "二次确认超时 (" + CONFIRM_TIMEOUT_SEC + " 秒), 已拒绝执行", decision.policyLabel());
+            return Decision.confirm(Kind.DENY, "二次确认超时 (" + CONFIRM_TIMEOUT_SEC + " 秒), 已拒绝执行", decision.policyLabel());
         } catch (InterruptedException e) {
             Thread.currentThread().interrupt();
-            return Decision.of(Kind.DENY, "二次确认被中断, 已拒绝执行", decision.policyLabel());
+            return Decision.confirm(Kind.DENY, "二次确认被中断, 已拒绝执行", decision.policyLabel());
         } catch (Exception e) {
             log.warn("二次确认失败 policy={}: {}", decision.policyLabel(), e.toString());
-            return Decision.of(Kind.DENY, "二次确认失败, 已拒绝执行", decision.policyLabel());
+            return Decision.confirm(Kind.DENY, "二次确认失败, 已拒绝执行", decision.policyLabel());
         }
         return verdict(result, decision);
     }
@@ -147,19 +147,19 @@ public class PolicyGate {
             Object approve = result.content() == null ? null : result.content().get(FIELD);
             // 用户勾了拒绝 (客户端把表单原样回传的场景) 也算拒绝
             if (Boolean.FALSE.equals(approve)) {
-                return Decision.of(Kind.DENY, "发起人已拒绝执行该命令", decision.policyLabel());
+                return Decision.confirm(Kind.DENY, "发起人已拒绝执行该命令", decision.policyLabel());
             }
             // 只认显式 true: 客户端不可信, 不能指望它按 requestedSchema 校验 —— 缺字段 / null / 类型不对
             // 一律当"没确认过". 否则一个不回内容的客户端就是一条自动放行通道, 整个闸门白设
             if (!Boolean.TRUE.equals(approve)) {
-                return Decision.of(Kind.DENY, "未取得明确的确认结果, 已拒绝执行", decision.policyLabel());
+                return Decision.confirm(Kind.DENY, "未取得明确的确认结果, 已拒绝执行", decision.policyLabel());
             }
             // 确认通过即终局放行, 不再回头查白名单
-            return Decision.of(Kind.ALLOW, "发起人已确认", decision.policyLabel());
+            return Decision.confirm(Kind.ALLOW, "发起人已确认", decision.policyLabel());
         }
         String why = action == McpSchema.ElicitResult.Action.DECLINE ? "发起人已拒绝执行该命令"
                 : action == McpSchema.ElicitResult.Action.CANCEL ? "发起人已取消确认" : "未取得确认结果";
-        return Decision.of(Kind.DENY, why, decision.policyLabel());
+        return Decision.confirm(Kind.DENY, why, decision.policyLabel());
     }
 
     private static final String FIELD = "approve";

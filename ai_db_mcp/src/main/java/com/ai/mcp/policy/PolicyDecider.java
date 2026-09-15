@@ -48,19 +48,44 @@ public class PolicyDecider {
     }
 
     /**
+     * 判定的来源环节: 审计要靠它把「策略拒绝」与「人工拒绝」分开 ——
+     * 两者在状态列都是「已拒绝」, 混在一起会让访问控制审计分不清"是策略拦的还是人拦的"
+     */
+    public enum Source {
+        /** 策略判定 (黑白名单 / 限流 / 白名单未命中 / 规则无效) */
+        POLICY,
+        /** 人工确认环节 (本人拒绝 / 取消 / 超时 / 客户端不支持 / 确认后授权复检不过) */
+        CONFIRM,
+        /** 鉴权环节 (拿不到调用身份这类, 压根没走到策略) */
+        AUTH
+    }
+
+    /**
      * @param policyLabel   命中的策略 (供弹窗与审计展示); 未命中任何策略时为 null
      * @param confirmWaited 这次判定在人工确认上阻塞过 (最长 CONFIRM_TIMEOUT_SEC 秒):
      *                      等待期间凭据可能已被管理员撤销/过期, 调用方用句柄前必须重校验授权
+     * @param source        判定来源, 决定审计里归到哪一类拒绝
      */
-    public record Decision(Kind kind, String reason, String policyLabel, boolean confirmWaited) {
+    public record Decision(Kind kind, String reason, String policyLabel, boolean confirmWaited, Source source) {
 
+        /** 策略判定 (默认来源) */
         static Decision of(Kind k, String reason, String policyLabel) {
-            return new Decision(k, reason, policyLabel, false);
+            return new Decision(k, reason, policyLabel, false, Source.POLICY);
+        }
+
+        /** 鉴权环节的判定: 没走到策略, 审计归「鉴权」 */
+        static Decision auth(Kind k, String reason) {
+            return new Decision(k, reason, null, false, Source.AUTH);
+        }
+
+        /** 人工确认环节的判定 (放行与拒绝都算): 审计归「人工」 */
+        static Decision confirm(Kind k, String reason, String policyLabel) {
+            return new Decision(k, reason, policyLabel, false, Source.CONFIRM);
         }
 
         /** 标记这次判定经过了人工确认等待 */
         Decision waited() {
-            return new Decision(kind, reason, policyLabel, true);
+            return new Decision(kind, reason, policyLabel, true, source);
         }
     }
 

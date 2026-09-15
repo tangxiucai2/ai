@@ -174,6 +174,10 @@ public class SshTool {
         return label == null ? decision.reason() : decision.reason() + " [策略: " + label + "]";
     }
 
+    /** 拒绝原因 + 来源环节 (审计要用来源区分「策略拒绝」与「人工拒绝」) */
+    private record Deny(String reason, PolicyDecider.Source source) {
+    }
+
     /**
      * 策略判定 → 拒绝原因; 通过返回 null
      * <p>
@@ -182,13 +186,16 @@ public class SshTool {
      * 放行 (阶段二既定口径: 身份本就不可信, 每次操作都回控制台既改变存量行为又白付性能), 那种模式下
      * 这里只剩「句柄还在 + 本地归属匹配」, 与 lookup 开头那次等价, 不构成额外的撤权保护。
      * 没等确认的路径不重复校验 —— lookup 刚刚校验过, 再来一次是白付一次控制台往返
+     * <p>
+     * 来源以判定自带的为准, 只有"确认等完发现授权已被撤"这一支不是判定产出的 —— 那是复检拦下的,
+     * 归 AUTH, 不能算成「人工拒绝」(人点了同意, 是授权没了)
      */
-    private String policyDeny(PolicyDecider.Decision decision, String connectionId, McpTransportContext ctx) {
+    private Deny policyDeny(PolicyDecider.Decision decision, String connectionId, McpTransportContext ctx) {
         if (decision.kind() != PolicyDecider.Kind.ALLOW) {
-            return policyReason(decision);
+            return new Deny(policyReason(decision), decision.source());
         }
         if (decision.confirmWaited() && !stillAuthorized(connectionId, ctx)) {
-            return notFound(connectionId, ctx);
+            return new Deny(notFound(connectionId, ctx), PolicyDecider.Source.AUTH);
         }
         // 限流配额不在这里记: 这一步只是"策略放行", openChannel/setCommand/connect 还可能失败
         // (远端拒绝新通道、网络抖动…), 那种情况下命令根本没跑起来。调用方在 channel.connect()
@@ -347,12 +354,13 @@ public class SshTool {
         }
 
         // 策略闸门在 lookup 之后: 用户自选模式的凭据(含 hostId)是 lookup 重校验时才拿到的
-        String denied = policyDeny(gate.check(ctx, exchange, command), connectionId, ctx);
+        Deny denied = policyDeny(gate.check(ctx, exchange, command), connectionId, ctx);
         if (denied != null) {
             result.put("success", false);
-            result.put("error", denied);
-            // 供 AuditLog 区分"策略拒绝"与"执行失败", 该字段在审计记录后会被摘掉不外传
-            result.put("denied", true);
+            result.put("error", denied.reason());
+            // 供 AuditLog 区分"策略拒绝/人工拒绝/鉴权拒绝"与"执行失败",
+            // 该字段在审计记录后会被摘掉, 不外传给调用方
+            result.put("denySource", denied.source().name());
             return result;
         }
 
@@ -476,12 +484,13 @@ public class SshTool {
         }
 
         // 策略闸门在 lookup 之后: 用户自选模式的凭据(含 hostId)是 lookup 重校验时才拿到的
-        String denied = policyDeny(gate.check(ctx, exchange, command), connectionId, ctx);
+        Deny denied = policyDeny(gate.check(ctx, exchange, command), connectionId, ctx);
         if (denied != null) {
             result.put("success", false);
-            result.put("error", denied);
-            // 供 AuditLog 区分"策略拒绝"与"执行失败", 该字段在审计记录后会被摘掉不外传
-            result.put("denied", true);
+            result.put("error", denied.reason());
+            // 供 AuditLog 区分"策略拒绝/人工拒绝/鉴权拒绝"与"执行失败",
+            // 该字段在审计记录后会被摘掉, 不外传给调用方
+            result.put("denySource", denied.source().name());
             return result;
         }
 
