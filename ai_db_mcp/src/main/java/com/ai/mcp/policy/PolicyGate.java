@@ -92,6 +92,12 @@ public class PolicyGate {
             // 只在新结果比"确认放行"更严 (DENY/APPROVAL) 时才收回旧许可; 新结果仍是 ALLOW/CONFIRM
             // 说明许可没被削弱, 不用为同一件事再弹一次窗 (那样会形成确认死循环)
             Decision fresh = decider.decide(cred.agentId(), cred.dbType(), cred.hostId(), command);
+            // （对现网问题的修订）fresh 升级为 APPROVAL 时必须走 /gate 建单, 不能像 DENY 那样直接
+            // 把这条未处理的裁决原样当拒绝返回——那样永远不会调用 approvalGate(), 审批单压根建不出来,
+            // 审计里还会显示成"策略拒绝"而不是"审批拦截" (二次确认期间策略被改成需要审批时的真实现网案例)
+            if (fresh.kind() == Kind.APPROVAL) {
+                return approval(ctx, fresh, tool, command, cred);
+            }
             if (fresh.kind() != Kind.ALLOW && fresh.kind() != Kind.CONFIRM) {
                 verdict = fresh;
             }
