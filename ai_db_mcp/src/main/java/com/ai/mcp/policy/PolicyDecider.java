@@ -2,7 +2,11 @@ package com.ai.mcp.policy;
 
 import org.springframework.stereotype.Component;
 
+import java.nio.charset.StandardCharsets;
+import java.security.MessageDigest;
+import java.security.NoSuchAlgorithmException;
 import java.util.ArrayList;
+import java.util.Comparator;
 import java.util.List;
 import java.util.regex.Pattern;
 import java.util.regex.PatternSyntaxException;
@@ -43,49 +47,66 @@ public class PolicyDecider {
         DENY,
         /** 需发起人本人二次确认 */
         CONFIRM,
-        /** 需管理员审批 (本期不产出放行, 一律拒) */
+        /** 需管理员审批: decide() 判定为这一档时, PolicyGate 会走 /gate 闸门 (第二部分) */
         APPROVAL
     }
 
     /**
-     * 判定的来源环节: 审计要靠它把「策略拒绝」与「人工拒绝」分开 ——
-     * 两者在状态列都是「已拒绝」, 混在一起会让访问控制审计分不清"是策略拦的还是人拦的"
+     * 判定的来源环节: 审计要靠它把「策略拒绝」「人工拒绝」「审批拦截」分开 ——
+     * 这几类在状态列都是「已拒绝」, 混在一起会让访问控制审计分不清是谁拦的
      */
     public enum Source {
         /** 策略判定 (黑白名单 / 限流 / 白名单未命中 / 规则无效) */
         POLICY,
         /** 人工确认环节 (本人拒绝 / 取消 / 超时 / 客户端不支持 / 确认后授权复检不过) */
         CONFIRM,
+        /** 审批闸门环节 (第二部分: 已提交/审批中/已被拒绝/审批服务不可用/加锁繁忙, 或最终放行) */
+        APPROVAL,
         /** 鉴权环节 (拿不到调用身份这类, 压根没走到策略) */
         AUTH
     }
 
     /**
-     * @param policyLabel   命中的策略 (供弹窗与审计展示); 未命中任何策略时为 null
-     * @param confirmWaited 这次判定在人工确认上阻塞过 (最长 CONFIRM_TIMEOUT_SEC 秒):
-     *                      等待期间凭据可能已被管理员撤销/过期, 调用方用句柄前必须重校验授权
-     * @param source        判定来源, 决定审计里归到哪一类拒绝
+     * @param policyLabel     命中的策略 (供弹窗与审计展示); 未命中任何策略时为 null
+     * @param confirmWaited   这次判定在人工确认/审批闸门上阻塞过 (最长 CONFIRM_TIMEOUT_SEC 秒, 或 /gate 的 HTTP 往返):
+     *                        等待期间凭据可能已被管理员撤销/过期, 调用方用句柄前必须重校验授权
+     * @param source          判定来源, 决定审计里归到哪一类拒绝
+     * @param policyRevision  仅 decide() 判定为 APPROVAL 时有值: 这次裁决实际命中的策略内容摘要 (设计文档 §2.1a),
+     *                        PolicyGate.approval() 用它组装 /gate 请求体, 与消费后 fresh decide 的结果比对
+     * @param approvalNo      仅审批闸门 PENDING/REJECTED 结果有值: 结构化返回给智能体, 引导原样重试 (设计文档结论 9)
+     * @param approvalStatus  同上, 取值 PENDING/REJECTED
      */
-    public record Decision(Kind kind, String reason, String policyLabel, boolean confirmWaited, Source source) {
+    public record Decision(Kind kind, String reason, String policyLabel, boolean confirmWaited, Source source,
+                           String policyRevision, String approvalNo, String approvalStatus) {
 
         /** 策略判定 (默认来源) */
         static Decision of(Kind k, String reason, String policyLabel) {
-            return new Decision(k, reason, policyLabel, false, Source.POLICY);
+            return new Decision(k, reason, policyLabel, false, Source.POLICY, null, null, null);
         }
 
         /** 鉴权环节的判定: 没走到策略, 审计归「鉴权」 */
         static Decision auth(Kind k, String reason) {
-            return new Decision(k, reason, null, false, Source.AUTH);
+            return new Decision(k, reason, null, false, Source.AUTH, null, null, null);
         }
 
         /** 人工确认环节的判定 (放行与拒绝都算): 审计归「人工」 */
         static Decision confirm(Kind k, String reason, String policyLabel) {
-            return new Decision(k, reason, policyLabel, false, Source.CONFIRM);
+            return new Decision(k, reason, policyLabel, false, Source.CONFIRM, null, null, null);
         }
 
-        /** 标记这次判定经过了人工确认等待 */
+        /** 审批闸门环节的判定 (建单/不可达/加锁繁忙/最终放行/fresh-decide 拒绝都算): 审计归「审批」, 第二部分新增 */
+        static Decision approval(Kind k, String reason, String policyLabel) {
+            return new Decision(k, reason, policyLabel, false, Source.APPROVAL, null, null, null);
+        }
+
+        /** 审批闸门 PENDING/REJECTED 结果专用: 带上单号/状态供调用方结构化返回给智能体 (设计文档结论 9) */
+        static Decision approval(Kind k, String reason, String policyLabel, String approvalNo, String approvalStatus) {
+            return new Decision(k, reason, policyLabel, false, Source.APPROVAL, null, approvalNo, approvalStatus);
+        }
+
+        /** 标记这次判定经过了人工确认/审批闸门等待 */
         Decision waited() {
-            return new Decision(kind, reason, policyLabel, true, source);
+            return new Decision(kind, reason, policyLabel, true, source, policyRevision, approvalNo, approvalStatus);
         }
     }
 
@@ -180,8 +201,9 @@ public class PolicyDecider {
         }
         switch (mode) {
             case "APPROVAL":
-                // 本期不产出放行: 协议级弹窗是同步阻塞的, 撑不起 24h 异步审批
-                return Decision.of(Kind.APPROVAL, "该策略需管理员审批, 管理员审批暂未生效", policyLabel);
+                // 第二部分: 生效了, 不再是"暂未生效"——PolicyGate 收到这一档会走 /gate 闸门。
+                // policyRevision 只摘要这次裁决实际命中的 matched (deny∪allow), 不是全部启用策略 (设计文档 §2.1a)
+                return new Decision(Kind.APPROVAL, "该策略需管理员审批", policyLabel, false, Source.POLICY, policyRevision(matched), null, null);
             case "CONFIRM":
                 return Decision.of(Kind.CONFIRM, why, policyLabel);
             default:
@@ -438,6 +460,49 @@ public class PolicyDecider {
             sb.append('#').append(p.id()).append(' ').append(p.type());
         }
         return sb.toString();
+    }
+
+    /**
+     * 策略内容摘要 (第二部分, 设计文档 §2.1a): 只摘要**这次裁决实际命中**的策略集合 (matched = deny ∪ allow),
+     * 不是全部启用策略——改一条不相关的策略不会让别的在途审批单集体失效。
+     * <p>
+     * 由网关计算而不是控制台 (与结论 16 的 fingerprint 信任边界不同, 见设计文档说明): 它不是展示给审批人看的内容,
+     * 只是一个不透明的失效触发器, 且依赖的命令匹配算法只存在于网关 (parse()/segmentTokens())
+     */
+    static String policyRevision(List<PolicyStore.Policy> matched) {
+        List<PolicyStore.Policy> sorted = new ArrayList<>(matched);
+        sorted.sort(Comparator.comparingLong(PolicyStore.Policy::id));
+        StringBuilder canonical = new StringBuilder();
+        for (PolicyStore.Policy p : sorted) {
+            canonical.append(p.id()).append('|').append(p.type()).append('|')
+                    .append(p.approvalMode()).append('|').append(p.rulesInvalid()).append('|');
+            for (PolicyStore.Op op : p.ops()) {
+                // （对 Codex 评审的修订）op.value() 是管理员填的任意正则/关键字文本, 可能自带 ':' ';' 这类
+                // 分隔符——直接拼接不是单射: 一条 REGEX 值 "x;KEYWORD:y" 和两条 {REGEX,"x"}+{KEYWORD,"y"}
+                // 会算出同一段字节, policyRevision 因此可能在规则真的改了之后仍然不变, 让结论 21 的
+                // fresh-decide 比对失效。value 长度前缀后再拼: matchType 取自固定小枚举不含 ':', 长度是
+                // 十进制数字不含 ':', 随后恰好消费该长度个字符（内容任意）——整条编码因此是无歧义的
+                String value = op.value() == null ? "" : op.value();
+                canonical.append(op.matchType()).append(':').append(value.length()).append(':').append(value).append(';');
+            }
+            canonical.append('\n');
+        }
+        return sha256Hex(canonical.toString());
+    }
+
+    private static String sha256Hex(String input) {
+        try {
+            MessageDigest digest = MessageDigest.getInstance("SHA-256");
+            byte[] hash = digest.digest(input.getBytes(StandardCharsets.UTF_8));
+            StringBuilder sb = new StringBuilder(hash.length * 2);
+            for (byte b : hash) {
+                sb.append(String.format("%02x", b));
+            }
+            return sb.toString();
+        } catch (NoSuchAlgorithmException e) {
+            // JDK 必带 SHA-256, 走到这里说明环境异常
+            throw new IllegalStateException("SHA-256 不可用", e);
+        }
     }
 
     private static String basename(String name) {

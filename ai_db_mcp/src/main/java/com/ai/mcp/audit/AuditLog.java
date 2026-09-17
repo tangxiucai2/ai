@@ -89,19 +89,24 @@ public class AuditLog {
         String srcIp = ctx == null ? null : (String) ctx.get(McpRequestFilter.SRC_IP);
         String userId = ctx == null ? null : (String) ctx.get(McpRequestFilter.USER_ID);
         long t0 = System.currentTimeMillis();
+        // 第二部分: 入口就生成这次调用的裸事件 id 并写进 ctx 持有的 holder——call.get() 内部
+        // (PolicyGate.approval()) 会读它拼成完整 CK 格式塞进 /gate 请求体; record() 复用同一个值,
+        // 不再自己调 nextId(), 否则两处各生成一次, request_id 存的和 CK 真正落库的对不上号 (设计文档结论 22)
+        String requestId = nextId(t0);
+        McpRequestFilter.setRequestId(ctx, requestId);
         Map<String, Object> r;
         try {
             r = call.get();
         } catch (RuntimeException e) {
-            record(pick(cred, auditCtx), identity, srcIp, userId, tool, summary, t0, FAILED, null, e.toString(), connectionId, null, null);
+            record(pick(cred, auditCtx), identity, srcIp, userId, tool, summary, t0, requestId, FAILED, null, e.toString(), connectionId, null, null);
             throw e;
         }
         // SSH 命令: 工具协议里非零退出码仍 success=true, 审计按退出码判失败并保留 stderr
         Object exit = r == null ? null : r.get("exitCode");
         boolean nonZero = exit instanceof Integer && (Integer) exit != 0;
         // 策略闸门拒绝的调用根本没执行, 不能跟"执行了但失败"混进同一个 FAILED —— 会让访问控制的
-        // 拒绝统计和真实故障率互相污染. 来源由 SshTool 在 policyDeny() 命中时打上 (POLICY/CONFIRM/AUTH),
-        // 控制台据此把「策略拒绝」与「人工拒绝」分开; 这里读完即摘掉, 不让内部字段泄漏给客户端
+        // 拒绝统计和真实故障率互相污染. 来源由 SshTool 在 policyDeny() 命中时打上 (POLICY/CONFIRM/APPROVAL/AUTH),
+        // 控制台据此把拒绝分类区分开; 这里读完即摘掉, 不让内部字段泄漏给客户端
         String denySource = r == null ? null : (String) r.remove("denySource");
         boolean denied = denySource != null;
         boolean ok = r != null && Boolean.TRUE.equals(r.get("success")) && !nonZero;
@@ -110,7 +115,7 @@ public class AuditLog {
                 : nonZero ? "exit=" + exit + (r.get("errorOutput") == null ? "" : " " + r.get("errorOutput"))
                 : String.valueOf(r.get("error"));
         Object[] res = resultOf(tool, r);
-        record(pick(cred, auditCtx), identity, srcIp, userId, tool, summary, t0, ok ? SUCCESS : denied ? DENIED : FAILED,
+        record(pick(cred, auditCtx), identity, srcIp, userId, tool, summary, t0, requestId, ok ? SUCCESS : denied ? DENIED : FAILED,
                 denySource, error, cid, (String) res[0], (Integer) res[1]);
         return r;
     }
@@ -180,7 +185,7 @@ public class AuditLog {
      * 用户自选模式下 list_credentials 之类没有凭据, 但身份必须齐全, 否则审计链断一截
      */
     private void record(ConsoleClient.Resolved cred, ConsoleClient.ResolvedUser identity, String srcIp, String userId,
-                        String tool, String summary, long t0,
+                        String tool, String summary, long t0, String requestId,
                         String status, String denySource, String error, String cid, String result, Integer lines) {
         String s = summary == null ? "" : cut(summary, SUMMARY_MAX);
         error = error == null ? null : cut(error, ERROR_MAX);
@@ -197,7 +202,8 @@ public class AuditLog {
         if (SKIP_SPOOL_TOOLS.contains(tool)) {
             return;
         }
-        spool(new Event(nextId(t0), cid, t0, cost, agentId, agentCode,
+        // requestId 是 run() 入口已经生成好的裸 id, 这里不再调 nextId() (设计文档结论 22)
+        spool(new Event(requestId, cid, t0, cost, agentId, agentCode,
                 credentialId, userName, userId, srcIp,
                 tool, eventType(tool, s), status, denySource, s, result, lines, error));
     }

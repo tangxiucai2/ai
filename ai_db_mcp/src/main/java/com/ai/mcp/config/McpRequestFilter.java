@@ -45,6 +45,13 @@ public class McpRequestFilter implements Filter {
     public static final String SRC_IP = "soag.src-ip";
     public static final String USER_ID = "soag.user-id";
 
+    /**
+     * 本次调用的审计事件裸 id (AuditLog.run() 入口生成, PolicyGate.approval() 读出拼成完整 CK 格式塞进
+     * /gate 请求体, 第二部分设计文档结论 22)。与 RESOLVED/DENY_REASON 不同——**两种鉴权模式都要预置**,
+     * 不能只放进用户自选模式那个 else 分支: 固定凭据模式同样会走 gate.check()/approval()
+     */
+    public static final String REQUEST_ID = "soag.requestId";
+
     /** 429 无 Servlet 常量 */
     private static final int SC_TOO_MANY_REQUESTS = 429;
 
@@ -163,6 +170,8 @@ public class McpRequestFilter implements Filter {
             userName = identity.userName();
             userId = String.valueOf(identity.userId());
         }
+        // 两种鉴权模式都要预置 (与上面 else 分支里那几个用户自选模式专属的 attribute 不同), 见 REQUEST_ID 字段注释
+        req.setAttribute(REQUEST_ID, new java.util.concurrent.atomic.AtomicReference<String>());
         req.setAttribute(SRC_IP, srcIp);
         req.setAttribute(USER_ID, userId);
         long t0 = System.currentTimeMillis();
@@ -276,5 +285,22 @@ public class McpRequestFilter implements Filter {
     @SuppressWarnings("unchecked")
     public static java.util.Set<Long> inFlight(McpTransportContext ctx) {
         return ctx == null ? null : (java.util.Set<Long>) ctx.get(IN_FLIGHT);
+    }
+
+    /** 本次调用的审计事件裸 id (两种鉴权模式都有, AuditLog.run() 入口写入) */
+    @SuppressWarnings("unchecked")
+    public static String requestId(McpTransportContext ctx) {
+        java.util.concurrent.atomic.AtomicReference<String> ref = ctx == null
+                ? null : (java.util.concurrent.atomic.AtomicReference<String>) ctx.get(REQUEST_ID);
+        return ref == null ? null : ref.get();
+    }
+
+    @SuppressWarnings("unchecked")
+    public static void setRequestId(McpTransportContext ctx, String id) {
+        java.util.concurrent.atomic.AtomicReference<String> ref = ctx == null
+                ? null : (java.util.concurrent.atomic.AtomicReference<String>) ctx.get(REQUEST_ID);
+        if (ref != null) {
+            ref.compareAndSet(null, id);
+        }
     }
 }

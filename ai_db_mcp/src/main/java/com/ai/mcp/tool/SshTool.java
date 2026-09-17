@@ -174,8 +174,13 @@ public class SshTool {
         return label == null ? decision.reason() : decision.reason() + " [策略: " + label + "]";
     }
 
-    /** 拒绝原因 + 来源环节 (审计要用来源区分「策略拒绝」与「人工拒绝」) */
-    private record Deny(String reason, PolicyDecider.Source source) {
+    /**
+     * 拒绝原因 + 来源环节 (审计要用来源区分不同拒绝类型)
+     *
+     * @param approvalNo     仅审批闸门 PENDING/REJECTED 结果有值 (设计文档结论 9), 结构化返回给智能体引导原样重试
+     * @param approvalStatus 同上, 取值 PENDING/REJECTED
+     */
+    private record Deny(String reason, PolicyDecider.Source source, String approvalNo, String approvalStatus) {
     }
 
     /**
@@ -192,10 +197,10 @@ public class SshTool {
      */
     private Deny policyDeny(PolicyDecider.Decision decision, String connectionId, McpTransportContext ctx) {
         if (decision.kind() != PolicyDecider.Kind.ALLOW) {
-            return new Deny(policyReason(decision), decision.source());
+            return new Deny(policyReason(decision), decision.source(), decision.approvalNo(), decision.approvalStatus());
         }
         if (decision.confirmWaited() && !stillAuthorized(connectionId, ctx)) {
-            return new Deny(notFound(connectionId, ctx), PolicyDecider.Source.AUTH);
+            return new Deny(notFound(connectionId, ctx), PolicyDecider.Source.AUTH, null, null);
         }
         // 限流配额不在这里记: 这一步只是"策略放行", openChannel/setCommand/connect 还可能失败
         // (远端拒绝新通道、网络抖动…), 那种情况下命令根本没跑起来。调用方在 channel.connect()
@@ -354,13 +359,17 @@ public class SshTool {
         }
 
         // 策略闸门在 lookup 之后: 用户自选模式的凭据(含 hostId)是 lookup 重校验时才拿到的
-        Deny denied = policyDeny(gate.check(ctx, exchange, command), connectionId, ctx);
+        Deny denied = policyDeny(gate.check(ctx, exchange, command, "ssh_execute"), connectionId, ctx);
         if (denied != null) {
             result.put("success", false);
             result.put("error", denied.reason());
-            // 供 AuditLog 区分"策略拒绝/人工拒绝/鉴权拒绝"与"执行失败",
-            // 该字段在审计记录后会被摘掉, 不外传给调用方
+            // 供 AuditLog 区分不同拒绝类型, 该字段在审计记录后会被摘掉, 不外传给调用方
             result.put("denySource", denied.source().name());
+            // 结构化字段, 引导智能体原样重试而不是改写命令换着法子试 (设计文档结论 9)
+            if (denied.approvalNo() != null) {
+                result.put("approvalNo", denied.approvalNo());
+                result.put("approvalStatus", denied.approvalStatus());
+            }
             return result;
         }
 
@@ -484,13 +493,17 @@ public class SshTool {
         }
 
         // 策略闸门在 lookup 之后: 用户自选模式的凭据(含 hostId)是 lookup 重校验时才拿到的
-        Deny denied = policyDeny(gate.check(ctx, exchange, command), connectionId, ctx);
+        Deny denied = policyDeny(gate.check(ctx, exchange, command, "ssh_execute_long_running"), connectionId, ctx);
         if (denied != null) {
             result.put("success", false);
             result.put("error", denied.reason());
-            // 供 AuditLog 区分"策略拒绝/人工拒绝/鉴权拒绝"与"执行失败",
-            // 该字段在审计记录后会被摘掉, 不外传给调用方
+            // 供 AuditLog 区分不同拒绝类型, 该字段在审计记录后会被摘掉, 不外传给调用方
             result.put("denySource", denied.source().name());
+            // 结构化字段, 引导智能体原样重试而不是改写命令换着法子试 (设计文档结论 9)
+            if (denied.approvalNo() != null) {
+                result.put("approvalNo", denied.approvalNo());
+                result.put("approvalStatus", denied.approvalStatus());
+            }
             return result;
         }
 

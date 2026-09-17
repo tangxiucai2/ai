@@ -7,6 +7,7 @@ import io.modelcontextprotocol.server.McpSyncServerExchange;
 import io.modelcontextprotocol.spec.McpSchema;
 import com.ai.mcp.policy.PolicyDecider.Decision;
 import com.ai.mcp.policy.PolicyDecider.Kind;
+import com.ai.mcp.policy.PolicyDecider.Source;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.stereotype.Component;
@@ -59,22 +60,28 @@ public class PolicyGate {
             new ThreadPoolExecutor.AbortPolicy());
 
     private final PolicyDecider decider;
+    private final ConsoleClient console;
 
-    public PolicyGate(PolicyDecider decider) {
+    public PolicyGate(PolicyDecider decider, ConsoleClient console) {
         this.decider = decider;
+        this.console = console;
     }
 
     /**
      * 判定一条 HOST 命令; 需要确认时在此阻塞等待用户点选
      *
+     * @param tool 调用方工具名 (ssh_execute / ssh_execute_long_running), 第二部分随 /gate 请求体传给控制台展示
      * @return 判定结果, {@link Kind#ALLOW} 之外一律按拒绝处理
      */
-    public Decision check(McpTransportContext ctx, McpSyncServerExchange exchange, String command) {
+    public Decision check(McpTransportContext ctx, McpSyncServerExchange exchange, String command, String tool) {
         ConsoleClient.Resolved cred = credential(ctx);
         if (cred == null) {
             return Decision.auth(Kind.DENY, "无法确定调用身份, 不能放行命令");
         }
         Decision decision = decider.decide(cred.agentId(), cred.dbType(), cred.hostId(), command);
+        if (decision.kind() == Kind.APPROVAL) {
+            return approval(ctx, decision, tool, command, cred);
+        }
         if (decision.kind() != Kind.CONFIRM) {
             return decision;
         }
@@ -95,6 +102,102 @@ public class PolicyGate {
     }
 
     /**
+     * 审批闸门 (第二部分): decide() 判定为 APPROVAL 时走这里, 立即返回 (不阻塞等待, 设计文档结论 1)——
+     * 不占 CONFIRM_POOL, 这是一次短 HTTP 调用 (ConsoleClient 的 readTimeout 是 10s), 不是可能阻塞
+     * 120 秒的 elicitation
+     */
+    private Decision approval(McpTransportContext ctx, Decision decision, String tool, String command, ConsoleClient.Resolved cred) {
+        ConsoleClient.ResolvedUser identity = McpRequestFilter.userIdentity(ctx);
+        Long userId = identity != null ? identity.userId() : null;
+        String bareRequestId = McpRequestFilter.requestId(ctx);
+        String fullRequestId = console.nodeId() + "-" + bareRequestId;
+        String resource = cred.address() == null || cred.address().isBlank() ? "cred#" + cred.credentialId()
+                : cred.address() + (cred.port() == null || cred.port() == 22 ? "" : ":" + cred.port());
+
+        Map<String, Object> body = new LinkedHashMap<>();
+        body.put("agentId", cred.agentId());
+        body.put("agentCode", cred.agentCode());
+        if (userId != null) {
+            body.put("userId", userId);
+        }
+        body.put("userName", cred.userName());
+        body.put("hostId", cred.hostId());
+        // ponytail: connectionId 只是展示字段, 不参与指纹, 这里不额外把它从调用方的签名里穿进来
+        body.put("resource", resource);
+        body.put("credentialId", cred.credentialId());
+        body.put("policyLabel", decision.policyLabel());
+        body.put("policyRevision", decision.policyRevision());
+        body.put("tool", tool);
+        body.put("operation", command);
+        body.put("requestId", fullRequestId);
+        body.put("clientRequestId", java.util.UUID.randomUUID().toString());
+
+        ConsoleClient.ApprovalGateResult result;
+        try {
+            result = console.approvalGate(body);
+        } catch (ConsoleClient.Rejected e) {
+            return Decision.approval(Kind.DENY, e.getMessage(), decision.policyLabel());
+        } catch (Exception e) {
+            log.warn("审批闸门调用失败 policy={}: {}", decision.policyLabel(), e.toString());
+            return Decision.approval(Kind.DENY, "审批服务不可达, 已暂停命令执行", decision.policyLabel());
+        }
+
+        // 必填字段缺失按响应异常处理, fail-closed (设计文档 §4.1 结尾): 不能只认 action 字段就放行,
+        // 控制台版本不一致/序列化异常时不能是一条无校验的放行/展示通道 —— 按 action 各自的必填字段表逐个校验
+        // （对本轮评审的修订：此前只校验了 ALLOW.approvalNo, PENDING/REJECTED 的必填字段没校验）
+        String action = result.action() == null ? "" : result.action();
+        boolean missing = switch (action) {
+            case "ALLOW", "PENDING" -> result.id() == null || isBlank(result.approvalNo())
+                    || ("PENDING".equals(action) && result.expireTimeMillis() == null);
+            case "REJECTED" -> result.id() == null || isBlank(result.approvalNo())
+                    || isBlank(result.comment()) || isBlank(result.approvedBy());
+            default -> false;
+        };
+        if (missing) {
+            return Decision.approval(Kind.DENY, "审批服务响应异常, 已暂停命令执行", decision.policyLabel());
+        }
+
+        switch (action) {
+            case "ALLOW": {
+                // fresh decide: 判据是 policyRevision 相等, 不是 kind() 归类 —— fresh 结果仍是 APPROVAL
+                // 完全可能是另一条策略的 APPROVAL (结论 18 要堵的正是这个), 按 kind() 归类会把刚绑上的
+                // policyRevision 又绕开。其余一切结果一律拒绝执行, 即便凭证已被消费也不回退 (结论 21, §12 残留风险 4)
+                Decision fresh = decider.decide(cred.agentId(), cred.dbType(), cred.hostId(), command);
+                if (fresh.kind() == Kind.APPROVAL && decision.policyRevision().equals(fresh.policyRevision())) {
+                    // .waited(): 复用既有 confirmWaited()/stillAuthorized() 机制堵撤权窗口 (结论 21 第二项) ——
+                    // 用户自选模式下 /gate 那段 HTTP 往返期间凭据可能被撤权, 这里同样要求调用方用句柄前重校验一次授权
+                    return Decision.approval(Kind.ALLOW, "经审批放行 " + result.approvalNo(), decision.policyLabel()).waited();
+                }
+                // 拒绝来源: 只有"fresh 仍判 APPROVAL 只是内容变了"才算 Source.APPROVAL；fresh 变成标准
+                // DENY/CONFIRM/ALLOW 时要保留它自己的 Source, 否则命中新黑名单这类真实策略拒绝会被审计
+                // 误归类成"审批拦截" (设计文档 §7 表格第 373 行, 两种情形要分清)
+                // policyLabel 同理改用 fresh 自己的标签 (对本轮评审的修订): decision.policyLabel() 是旧策略
+                // 的标签, SshTool.policyReason() 会把它原样拼进拒绝文案和审计, 继续用旧标签会把"命中新
+                // 黑名单"这类场景误归因到已经过时的旧策略
+                Source denySource = fresh.kind() == Kind.APPROVAL ? Source.APPROVAL : fresh.source();
+                return new Decision(Kind.DENY, "凭证已消费但策略已变更, 已拒绝执行", fresh.policyLabel(), false, denySource, null, null, null);
+            }
+            case "PENDING":
+                return Decision.approval(Kind.DENY,
+                        "该命令需管理员审批, 已提交审批单 " + result.approvalNo()
+                                + "。请勿修改命令内容——修改后需重新审批。审批通过后原样重试本命令即可执行。",
+                        decision.policyLabel(), result.approvalNo(), "PENDING");
+            case "REJECTED":
+                // 处理人一并拼进文案 (设计文档 §10 验收清单第 5 条: "直接回拒绝意见 + 处理人"),
+                // comment/approvedBy 已在上面的必填校验里保证非空, 不用再判空
+                return Decision.approval(Kind.DENY,
+                        "该命令已被拒绝执行 (单号 " + result.approvalNo() + ", 处理人: " + result.approvedBy()
+                                + ", 理由: " + result.comment() + ")",
+                        decision.policyLabel(), result.approvalNo(), "REJECTED");
+            case "BUSY":
+                // /gate 内部加锁失败 (设计文档 §4.2), 与"控制台不可达"是两种不同原因, 文案分开
+                return Decision.approval(Kind.DENY, "审批服务繁忙, 请重试", decision.policyLabel());
+            default:
+                return Decision.approval(Kind.DENY, "审批服务响应异常, 已暂停命令执行", decision.policyLabel());
+        }
+    }
+
+    /**
      * 放行执行时记账, 由调用方在**真的要执行**时调用 (不是判定为 ALLOW 就调)
      * <p>
      * 限流配额只计"真正执行的调用"(结论 16): 等过确认的调用还要过工具层的授权复检, 复检没过就不会
@@ -105,6 +208,10 @@ public class PolicyGate {
         if (cred != null) {
             decider.recordRate(cred.agentId(), cred.dbType(), cred.hostId());
         }
+    }
+
+    private static boolean isBlank(String s) {
+        return s == null || s.isBlank();
     }
 
     /** 已解析出的凭据优先 (用户自选模式在建连/重校验时才拿得到), 再退回请求级凭据 */

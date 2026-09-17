@@ -575,6 +575,39 @@ public class ConsoleClient {
     }
 
     /**
+     * 风险审批闸门 (第二部分, 设计文档 §4.1): 试消费凭证 / 查在途冷却 / 建新单, 由 PolicyGate.approval() 调用。
+     * id 字段业务逻辑用不上, 但按 action 校验必填字段做 fail-closed 判定 (设计文档 §4.1 结尾) 需要解析出来
+     * （对本轮评审的修订：此前不解析 id, 导致 PolicyGate 端无法判断 ALLOW/PENDING/REJECTED 是否缺字段）
+     * <p>
+     * expireTimeMillis 是 Long 不是 String（对 Codex 评审的修订）：控制台 VO 里这是 Date 字段，按这个项目
+     * 既有接口约定统一序列化成毫秒数（前端 AgentApprovalQueryResponse.expireTime 同样是 number，非
+     * ISO 字符串），(String) 强转在 PENDING 场景每次都会 ClassCastException——那恰好是最常见的首次建单
+     * 结果，等于整条"建单成功"路径必炸。照本类里其余数字字段（如 d.get("hostId")）同款 Number 解析
+     *
+     * @throws Rejected  控制台明确拒绝 (理论上验签已在 Filter 层挡过, 这里只是与其余接口同一分流口径保持一致)
+     * @throws Exception 控制台不可达
+     */
+    public record ApprovalGateResult(String action, Long id, String approvalNo, Long expireTimeMillis, String comment, String approvedBy) {
+    }
+
+    @SuppressWarnings("unchecked")
+    public ApprovalGateResult approvalGate(Map<String, Object> body) throws Exception {
+        Map<String, Object> d = (Map<String, Object>) checkedData(signedPost("/agent/approval/gate", body));
+        return new ApprovalGateResult(
+                (String) d.get("action"),
+                d.get("id") instanceof Number idNum ? idNum.longValue() : null,
+                (String) d.get("approvalNo"),
+                d.get("expireTime") instanceof Number n ? n.longValue() : null,
+                (String) d.get("comment"),
+                (String) d.get("approvedBy"));
+    }
+
+    /** 本节点 code, 用于拼接完整 CK 格式的调用事件 id (nodeCode-裸id, 第二部分设计文档结论 22) */
+    public String nodeId() {
+        return nodeId;
+    }
+
+    /**
      * 与 resolve 同款错误分流: 400/401/403 是控制台明确拒绝 (回 403), 其余属故障 (走 503)
      */
     private static Object checkedData(Map<String, Object> resp) {
