@@ -53,12 +53,14 @@ public class PolicyStore {
     /**
      * 一条启用中的 HOST 类策略; type=RATE_LIMIT 的不参与黑白名单匹配 (见 {@code PolicyDecider.applicable})
      *
+     * @param name         策略名称 (管理员填写, 展示用, 不参与裁决/policyRevision)
      * @param rulesInvalid 控制台判定规则无效 (存量/人工导入的坏行); 该策略适用范围内一律拒绝, 不当无策略跳过
+     * @param rulesSummary 规则内容摘要 (展示用, 不参与裁决/policyRevision); 规则无效时为 null
      * @param limit        仅 RATE_LIMIT: 窗口内次数上限 (有效的限流策略必填, 缺了整次拉取算失败)
      * @param windowSeconds 仅 RATE_LIMIT: 窗口长度 (秒); 非限流类恒 0, 不参与裁决
      */
-    public record Policy(long id, String type, String hostType, long hostId, long agentId,
-                         String approvalMode, boolean rulesInvalid, List<Op> ops,
+    public record Policy(long id, String name, String type, String hostType, long hostId, long agentId,
+                         String approvalMode, boolean rulesInvalid, String rulesSummary, List<Op> ops,
                          long limit, long windowSeconds) {
     }
 
@@ -145,6 +147,10 @@ public class PolicyStore {
                     || !p.path("hostId").isNumber() || !p.path("agentId").isNumber()) {
                 throw new IllegalStateException("策略快照条目缺少作用域字段: " + p);
             }
+            // name 展示用但要求非空: 控制台表结构本就 NOT NULL, 缺失说明快照结构不对, 同一套 fail-closed 口径
+            if (!p.path("name").isTextual() || p.path("name").asText().isBlank()) {
+                throw new IllegalStateException("策略快照条目缺少 name: " + p);
+            }
             // 档位值必须在值域内: 上层的 indexOf 对未知值给 -1, 会被静默降级成 NONE ——
             // 未来控制台加了新档位 (或写错) 时, 本该确认/审批的命令会直接放行
             if (!p.path("approvalMode").isTextual() || !APPROVAL_MODES.contains(p.path("approvalMode").asText())) {
@@ -190,9 +196,11 @@ public class PolicyStore {
                 }
                 ops.add(new Op(opValue, matchType));
             }
-            policies.add(new Policy(p.path("id").asLong(), type, p.path("hostType").asText(""),
+            // rulesSummary 展示用可空 (规则无效时控制台本就不下发有意义的摘要), 不必牵连整次拉取失败
+            String rulesSummary = p.path("rulesSummary").isTextual() ? p.path("rulesSummary").asText() : null;
+            policies.add(new Policy(p.path("id").asLong(), p.path("name").asText(), type, p.path("hostType").asText(""),
                     p.path("hostId").asLong(), p.path("agentId").asLong(),
-                    p.path("approvalMode").asText("NONE"), invalid,
+                    p.path("approvalMode").asText("NONE"), invalid, rulesSummary,
                     List.copyOf(ops),
                     p.path("limit").asLong(), p.path("windowSeconds").asLong()));
         }

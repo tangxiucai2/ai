@@ -75,38 +75,40 @@ public class PolicyDecider {
      *                        PolicyGate.approval() 用它组装 /gate 请求体, 与消费后 fresh decide 的结果比对
      * @param approvalNo      仅审批闸门 PENDING/REJECTED 结果有值: 结构化返回给智能体, 引导原样重试 (设计文档结论 9)
      * @param approvalStatus  同上, 取值 PENDING/REJECTED
+     * @param policyType      仅 decide() 判定为 APPROVAL 时有值: 命中策略类型的中文标签 (操作黑名单/操作白名单,
+     *                        可能逗号并列多个), 审批单标题展示用, 与 policyLabel (策略名称+规则摘要) 是两码事
      */
     public record Decision(Kind kind, String reason, String policyLabel, boolean confirmWaited, Source source,
-                           String policyRevision, String approvalNo, String approvalStatus) {
+                           String policyRevision, String approvalNo, String approvalStatus, String policyType) {
 
         /** 策略判定 (默认来源) */
         static Decision of(Kind k, String reason, String policyLabel) {
-            return new Decision(k, reason, policyLabel, false, Source.POLICY, null, null, null);
+            return new Decision(k, reason, policyLabel, false, Source.POLICY, null, null, null, null);
         }
 
         /** 鉴权环节的判定: 没走到策略, 审计归「鉴权」 */
         static Decision auth(Kind k, String reason) {
-            return new Decision(k, reason, null, false, Source.AUTH, null, null, null);
+            return new Decision(k, reason, null, false, Source.AUTH, null, null, null, null);
         }
 
         /** 人工确认环节的判定 (放行与拒绝都算): 审计归「人工」 */
         static Decision confirm(Kind k, String reason, String policyLabel) {
-            return new Decision(k, reason, policyLabel, false, Source.CONFIRM, null, null, null);
+            return new Decision(k, reason, policyLabel, false, Source.CONFIRM, null, null, null, null);
         }
 
         /** 审批闸门环节的判定 (建单/不可达/加锁繁忙/最终放行/fresh-decide 拒绝都算): 审计归「审批」, 第二部分新增 */
         static Decision approval(Kind k, String reason, String policyLabel) {
-            return new Decision(k, reason, policyLabel, false, Source.APPROVAL, null, null, null);
+            return new Decision(k, reason, policyLabel, false, Source.APPROVAL, null, null, null, null);
         }
 
         /** 审批闸门 PENDING/REJECTED 结果专用: 带上单号/状态供调用方结构化返回给智能体 (设计文档结论 9) */
         static Decision approval(Kind k, String reason, String policyLabel, String approvalNo, String approvalStatus) {
-            return new Decision(k, reason, policyLabel, false, Source.APPROVAL, null, approvalNo, approvalStatus);
+            return new Decision(k, reason, policyLabel, false, Source.APPROVAL, null, approvalNo, approvalStatus, null);
         }
 
         /** 标记这次判定经过了人工确认/审批闸门等待 */
         Decision waited() {
-            return new Decision(kind, reason, policyLabel, true, source, policyRevision, approvalNo, approvalStatus);
+            return new Decision(kind, reason, policyLabel, true, source, policyRevision, approvalNo, approvalStatus, policyType);
         }
     }
 
@@ -203,7 +205,8 @@ public class PolicyDecider {
             case "APPROVAL":
                 // 第二部分: 生效了, 不再是"暂未生效"——PolicyGate 收到这一档会走 /gate 闸门。
                 // policyRevision 只摘要这次裁决实际命中的 matched (deny∪allow), 不是全部启用策略 (设计文档 §2.1a)
-                return new Decision(Kind.APPROVAL, "该策略需管理员审批", policyLabel, false, Source.POLICY, policyRevision(matched), null, null);
+                return new Decision(Kind.APPROVAL, "该策略需管理员审批", policyLabel, false, Source.POLICY,
+                        policyRevision(matched), null, null, typeLabel(matched));
             case "CONFIRM":
                 return Decision.of(Kind.CONFIRM, why, policyLabel);
             default:
@@ -450,16 +453,51 @@ public class PolicyDecider {
         return MODES.get(max);
     }
 
-    /** 命中策略的可读标签, 进弹窗与审计 */
+    /**
+     * 命中策略的可读标签, 进弹窗、审计与审批单"触发策略"展示
+     * <p>
+     * 用策略名称 + 规则摘要 (照控制台策略列表页 rulesSummary 同一份计算), 不再是内部 "#id TYPE" ——
+     * 后者管理员看不懂命中的具体是什么。规则无效 (rulesSummary 为 null) 时只展示名称
+     */
     static String label(List<PolicyStore.Policy> policies) {
         StringBuilder sb = new StringBuilder();
         for (PolicyStore.Policy p : policies) {
             if (sb.length() > 0) {
                 sb.append(',');
             }
-            sb.append('#').append(p.id()).append(' ').append(p.type());
+            sb.append(p.name());
+            if (p.rulesSummary() != null && !p.rulesSummary().isBlank()) {
+                sb.append('（').append(p.rulesSummary()).append('）');
+            }
         }
         return sb.toString();
+    }
+
+    /**
+     * 命中策略类型的中文标签, 逗号并列去重 (混合命中黑名单+白名单的极端情况, 审批单标题展示用)
+     * <p>
+     * 用于生成"操作黑名单（主机名）风险审批"这类标题——与 {@link #label} 是两个独立字段:
+     * label() 给的是具体策略的名称+规则摘要 (供"触发策略"详情展示), 这里给的是类型大类
+     */
+    static String typeLabel(List<PolicyStore.Policy> policies) {
+        List<String> types = new ArrayList<>();
+        for (PolicyStore.Policy p : policies) {
+            String t = typeLabel(p.type());
+            if (!types.contains(t)) {
+                types.add(t);
+            }
+        }
+        return String.join(",", types);
+    }
+
+    private static String typeLabel(String type) {
+        if (PolicyStore.TYPE_BLACKLIST.equals(type)) {
+            return "操作黑名单";
+        }
+        if (PolicyStore.TYPE_WHITELIST.equals(type)) {
+            return "操作白名单";
+        }
+        return type;
     }
 
     /**

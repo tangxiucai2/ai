@@ -133,6 +133,7 @@ public class PolicyGate {
         body.put("credentialId", cred.credentialId());
         body.put("policyLabel", decision.policyLabel());
         body.put("policyRevision", decision.policyRevision());
+        body.put("policyType", decision.policyType());
         body.put("tool", tool);
         body.put("operation", command);
         body.put("requestId", fullRequestId);
@@ -181,7 +182,7 @@ public class PolicyGate {
                 // 的标签, SshTool.policyReason() 会把它原样拼进拒绝文案和审计, 继续用旧标签会把"命中新
                 // 黑名单"这类场景误归因到已经过时的旧策略
                 Source denySource = fresh.kind() == Kind.APPROVAL ? Source.APPROVAL : fresh.source();
-                return new Decision(Kind.DENY, "凭证已消费但策略已变更, 已拒绝执行", fresh.policyLabel(), false, denySource, null, null, null);
+                return new Decision(Kind.DENY, "凭证已消费但策略已变更, 已拒绝执行", fresh.policyLabel(), false, denySource, null, null, null, null);
             }
             case "PENDING":
                 return Decision.approval(Kind.DENY,
