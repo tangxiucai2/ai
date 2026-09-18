@@ -74,6 +74,9 @@ public class PolicyGate {
         if (decision.kind() == Kind.APPROVAL) {
             return approval(ctx, decision, tool, command, cred);
         }
+        if (decision.kind() == Kind.BOTH) {
+            return confirmThenApproval(ctx, exchange, decision, tool, command, cred);
+        }
         if (decision.kind() != Kind.CONFIRM) {
             return decision;
         }
@@ -87,7 +90,8 @@ public class PolicyGate {
             // （对现网问题的修订）fresh 升级为 APPROVAL 时必须走 /gate 建单, 不能像 DENY 那样直接
             // 把这条未处理的裁决原样当拒绝返回——那样永远不会调用 approvalGate(), 审批单压根建不出来,
             // 审计里还会显示成"策略拒绝"而不是"审批拦截" (二次确认期间策略被改成需要审批时的真实现网案例)
-            if (fresh.kind() == Kind.APPROVAL) {
+            // fresh 升级为 BOTH 时同样要走: 用户已经做完确认, 不需要再走 confirmThenApproval() 重弹一次
+            if (fresh.kind() == Kind.APPROVAL || fresh.kind() == Kind.BOTH) {
                 return approval(ctx, fresh, tool, command, cred);
             }
             if (fresh.kind() != Kind.ALLOW && fresh.kind() != Kind.CONFIRM) {
@@ -100,9 +104,37 @@ public class PolicyGate {
     }
 
     /**
+     * 二次确认 + 风险审批都要: decide() 判定为 BOTH 时走这里, 先 confirm() 再 approval()——
+     * 先本人确认再管理员审批, 任一环节拒绝即终止 (设计文档 2026-09-18 §2.3)
+     */
+    private Decision confirmThenApproval(McpTransportContext ctx, McpSyncServerExchange exchange,
+                                          Decision decision, String tool, String command, ConsoleClient.Resolved cred) {
+        Decision verdict = confirm(exchange, command, decision);
+        if (verdict.kind() != Kind.ALLOW) {
+            // 确认失败/拒绝/超时/不支持: 终止, 不进入审批
+            return verdict.waited();
+        }
+        // 与既有 CONFIRM 分支同款: 确认等待期间策略可能已变, 用当前快照重新裁决一次
+        Decision fresh = decider.decide(cred.agentId(), cred.dbType(), cred.hostId(), command);
+        if (fresh.kind() == Kind.APPROVAL || fresh.kind() == Kind.BOTH) {
+            // 仍需要审批 (原样是 BOTH, 或被放宽成纯 APPROVAL 都要走): 用 fresh 走 /gate
+            return approval(ctx, fresh, tool, command, cred).waited();
+        }
+        if (fresh.kind() != Kind.ALLOW && fresh.kind() != Kind.CONFIRM) {
+            // 策略在等待期间被收紧到 DENY: 收回许可
+            return fresh.waited();
+        }
+        // 降级为 ALLOW/CONFIRM (已经确认过一次, 不重复弹): 确认已完成, 直接放行
+        return Decision.confirm(Kind.ALLOW, "发起人已确认", decision.policyLabel()).waited();
+    }
+
+    /**
      * 审批闸门 (第二部分): decide() 判定为 APPROVAL 时走这里, 立即返回 (不阻塞等待, 设计文档结论 1)——
      * 不占 CONFIRM_POOL, 这是一次短 HTTP 调用 (ConsoleClient 的 readTimeout 是 10s), 不是可能阻塞
      * 数十至数百秒 (控制台下发, 最长 300 秒) 的 elicitation
+     * <p>
+     * 也被 {@link #confirmThenApproval} 复用 (BOTH 模式确认通过后): 传入的 decision 可能来自 fresh 重新裁决,
+     * kind() 可能是 APPROVAL 或 BOTH, 本方法内部不读 kind(), 只读 policyLabel/policyRevision/policyType 三个字段
      */
     private Decision approval(McpTransportContext ctx, Decision decision, String tool, String command, ConsoleClient.Resolved cred) {
         ConsoleClient.ResolvedUser identity = McpRequestFilter.userIdentity(ctx);
@@ -158,22 +190,25 @@ public class PolicyGate {
 
         switch (action) {
             case "ALLOW": {
-                // fresh decide: 判据是 policyRevision 相等, 不是 kind() 归类 —— fresh 结果仍是 APPROVAL
-                // 完全可能是另一条策略的 APPROVAL (结论 18 要堵的正是这个), 按 kind() 归类会把刚绑上的
+                // fresh decide: 判据是 policyRevision 相等, 不是 kind() 归类 —— fresh 结果仍是 APPROVAL/BOTH
+                // 完全可能是另一条策略的 (结论 18 要堵的正是这个), 按 kind() 归类会把刚绑上的
                 // policyRevision 又绕开。其余一切结果一律拒绝执行, 即便凭证已被消费也不回退 (结论 21, §12 残留风险 4)
+                // BOTH 也要纳入 (设计文档 2026-09-18 §0.5): confirmThenApproval() 通过 BOTH 走到这里时,
+                // fresh 重新裁决出的仍是 BOTH 不是 APPROVAL —— 漏判会导致 BOTH 模式走完全部流程仍被拒绝
                 Decision fresh = decider.decide(cred.agentId(), cred.dbType(), cred.hostId(), command);
-                if (fresh.kind() == Kind.APPROVAL && decision.policyRevision().equals(fresh.policyRevision())) {
+                if ((fresh.kind() == Kind.APPROVAL || fresh.kind() == Kind.BOTH)
+                        && decision.policyRevision().equals(fresh.policyRevision())) {
                     // .waited(): 复用既有 confirmWaited()/stillAuthorized() 机制堵撤权窗口 (结论 21 第二项) ——
                     // 用户自选模式下 /gate 那段 HTTP 往返期间凭据可能被撤权, 这里同样要求调用方用句柄前重校验一次授权
                     return Decision.approval(Kind.ALLOW, "经审批放行 " + result.approvalNo(), decision.policyLabel()).waited();
                 }
-                // 拒绝来源: 只有"fresh 仍判 APPROVAL 只是内容变了"才算 Source.APPROVAL；fresh 变成标准
+                // 拒绝来源: 只有"fresh 仍判 APPROVAL/BOTH 只是内容变了"才算 Source.APPROVAL；fresh 变成标准
                 // DENY/CONFIRM/ALLOW 时要保留它自己的 Source, 否则命中新黑名单这类真实策略拒绝会被审计
                 // 误归类成"审批拦截" (设计文档 §7 表格第 373 行, 两种情形要分清)
                 // policyLabel 同理改用 fresh 自己的标签 (对本轮评审的修订): decision.policyLabel() 是旧策略
                 // 的标签, SshTool.policyReason() 会把它原样拼进拒绝文案和审计, 继续用旧标签会把"命中新
                 // 黑名单"这类场景误归因到已经过时的旧策略
-                Source denySource = fresh.kind() == Kind.APPROVAL ? Source.APPROVAL : fresh.source();
+                Source denySource = (fresh.kind() == Kind.APPROVAL || fresh.kind() == Kind.BOTH) ? Source.APPROVAL : fresh.source();
                 return new Decision(Kind.DENY, "凭证已消费但策略已变更, 已拒绝执行", fresh.policyLabel(), false, denySource, null, null, null, null);
             }
             case "PENDING":

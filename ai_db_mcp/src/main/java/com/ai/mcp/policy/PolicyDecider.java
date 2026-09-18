@@ -37,8 +37,11 @@ public class PolicyDecider {
 
     private static final String MODE_APPROVAL = "APPROVAL";
 
+    /** 二次确认 + 风险审批都要 (单列四值, 不额外加布尔列): 先确认后审批, 任一环节拒绝即终止 */
+    private static final String MODE_BOTH = "BOTH";
+
     /** 白名单侧的严格度次序: 越靠后越严 (黑名单侧见 {@link #denyMode}: NONE 是最严的一档) */
-    private static final List<String> MODES = List.of(MODE_NONE, MODE_CONFIRM, MODE_APPROVAL);
+    private static final List<String> MODES = List.of(MODE_NONE, MODE_CONFIRM, MODE_APPROVAL, MODE_BOTH);
 
     public enum Kind {
         /** 通过 */
@@ -48,7 +51,9 @@ public class PolicyDecider {
         /** 需发起人本人二次确认 */
         CONFIRM,
         /** 需管理员审批: decide() 判定为这一档时, PolicyGate 会走 /gate 闸门 (第二部分) */
-        APPROVAL
+        APPROVAL,
+        /** 二次确认 + 风险审批都要: PolicyGate 先 confirm() 再 approval(), 任一环节拒绝即终止 */
+        BOTH
     }
 
     /**
@@ -71,11 +76,11 @@ public class PolicyDecider {
      * @param confirmWaited   这次判定在人工确认/审批闸门上阻塞过 (最长按控制台下发的确认超时, 或 /gate 的 HTTP 往返):
      *                        等待期间凭据可能已被管理员撤销/过期, 调用方用句柄前必须重校验授权
      * @param source          判定来源, 决定审计里归到哪一类拒绝
-     * @param policyRevision  仅 decide() 判定为 APPROVAL 时有值: 这次裁决实际命中的策略内容摘要 (设计文档 §2.1a),
+     * @param policyRevision  仅 decide() 判定为 APPROVAL 或 BOTH 时有值: 这次裁决实际命中的策略内容摘要 (设计文档 §2.1a),
      *                        PolicyGate.approval() 用它组装 /gate 请求体, 与消费后 fresh decide 的结果比对
      * @param approvalNo      仅审批闸门 PENDING/REJECTED 结果有值: 结构化返回给智能体, 引导原样重试 (设计文档结论 9)
      * @param approvalStatus  同上, 取值 PENDING/REJECTED
-     * @param policyType      仅 decide() 判定为 APPROVAL 时有值: 命中策略类型的中文标签 (操作黑名单/操作白名单,
+     * @param policyType      仅 decide() 判定为 APPROVAL 或 BOTH 时有值: 命中策略类型的中文标签 (操作黑名单/操作白名单,
      *                        可能逗号并列多个), 审批单标题展示用, 与 policyLabel (策略名称+规则摘要) 是两码事
      */
     public record Decision(Kind kind, String reason, String policyLabel, boolean confirmWaited, Source source,
@@ -196,8 +201,10 @@ public class PolicyDecider {
         // 白名单的 CONFIRM 不能把黑名单的直接拒救成可确认, 白名单的 NONE (直接放行) 更不能
         List<PolicyStore.Policy> matched = new ArrayList<>(deny);
         matched.addAll(allow);
-        if (!MODE_NONE.equals(mode) && anyApproval(matched)) {
-            mode = MODE_APPROVAL;
+        if (!MODE_NONE.equals(mode) && requiresApproval(matched)) {
+            // 升到 APPROVAL 还是 BOTH 取决于抬档的是哪条: 命中集合里只要有一条 BOTH 就不能把"还需要
+            // 确认"这个要求吞掉, 必须升到 BOTH; 都是 APPROVAL 才升到 APPROVAL
+            mode = matched.stream().anyMatch(p -> MODE_BOTH.equals(p.approvalMode())) ? MODE_BOTH : MODE_APPROVAL;
             // 档位是别条策略抬上来的, 标签得跟着走 —— 否则审计里指的策略不是要求审批的那条
             policyLabel = label(matched);
         }
@@ -206,6 +213,11 @@ public class PolicyDecider {
                 // 第二部分: 生效了, 不再是"暂未生效"——PolicyGate 收到这一档会走 /gate 闸门。
                 // policyRevision 只摘要这次裁决实际命中的 matched (deny∪allow), 不是全部启用策略 (设计文档 §2.1a)
                 return new Decision(Kind.APPROVAL, "该策略需管理员审批", policyLabel, false, Source.POLICY,
+                        policyRevision(matched), null, null, typeLabel(matched));
+            case "BOTH":
+                // 二次确认 + 风险审批都要: 结构照抄 APPROVAL 分支 (同样要带 policyRevision/policyType,
+                // PolicyGate.confirmThenApproval() 确认通过后要用它们走 /gate)
+                return new Decision(Kind.BOTH, "该策略需二次确认及管理员审批", policyLabel, false, Source.POLICY,
                         policyRevision(matched), null, null, typeLabel(matched));
             case "CONFIRM":
                 return Decision.of(Kind.CONFIRM, why, policyLabel);
@@ -413,7 +425,7 @@ public class PolicyDecider {
     }
 
     /**
-     * 拒判基调下的档位: 只要有一条黑名单是 NONE (无条件拒绝) 或 APPROVAL, 就不允许本人确认;
+     * 拒判基调下的档位: 只要有一条黑名单是 NONE (无条件拒绝)、APPROVAL 或 BOTH, 就不允许直接本人确认放行;
      * 全部是 CONFIRM 时才落到 CONFIRM
      * <p>
      * 不能复用 {@link #strictestMode}: 那是白名单的次序 (NONE 最松)。NONE 只在黑名单一侧表示"无条件"
@@ -425,16 +437,19 @@ public class PolicyDecider {
             if (MODE_NONE.equals(m)) {
                 return MODE_NONE;
             }
-            if (MODE_APPROVAL.equals(m)) {
+            if (MODE_BOTH.equals(m)) {
+                out = MODE_BOTH;
+            } else if (MODE_APPROVAL.equals(m) && !MODE_BOTH.equals(out)) {
                 out = MODE_APPROVAL;
             }
         }
         return out;
     }
 
-    private static boolean anyApproval(List<PolicyStore.Policy> policies) {
+    /** 命中集合里是否有策略要求 APPROVAL 或 BOTH (跨策略合并升档用, 不能只认 APPROVAL 而漏判 BOTH) */
+    private static boolean requiresApproval(List<PolicyStore.Policy> policies) {
         for (PolicyStore.Policy p : policies) {
-            if (MODE_APPROVAL.equals(p.approvalMode())) {
+            if (MODE_APPROVAL.equals(p.approvalMode()) || MODE_BOTH.equals(p.approvalMode())) {
                 return true;
             }
         }

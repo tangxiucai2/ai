@@ -39,7 +39,7 @@ public class PolicyStore {
     public static final String TYPE_RATE_LIMIT = "RATE_LIMIT";
 
     /** 人工介入档位; 未知值按「快照无效」处理, 不能静默降级成 NONE */
-    private static final Set<String> APPROVAL_MODES = Set.of("NONE", "CONFIRM", "APPROVAL");
+    private static final Set<String> APPROVAL_MODES = Set.of("NONE", "CONFIRM", "APPROVAL", "BOTH");
 
     private static final String REGEX = "REGEX";
 
