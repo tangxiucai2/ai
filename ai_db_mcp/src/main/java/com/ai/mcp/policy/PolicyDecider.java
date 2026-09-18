@@ -1,10 +1,19 @@
 package com.ai.mcp.policy;
 
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 import org.springframework.stereotype.Component;
 
 import java.nio.charset.StandardCharsets;
 import java.security.MessageDigest;
 import java.security.NoSuchAlgorithmException;
+import java.time.LocalDateTime;
+import java.time.LocalTime;
+import java.time.ZoneId;
+import java.time.ZonedDateTime;
+import java.time.format.DateTimeFormatter;
+import java.time.format.ResolverStyle;
+import java.time.temporal.ChronoUnit;
 import java.util.ArrayList;
 import java.util.Comparator;
 import java.util.List;
@@ -24,6 +33,16 @@ import java.util.regex.PatternSyntaxException;
  */
 @Component
 public class PolicyDecider {
+
+    private static final Logger log = LoggerFactory.getLogger(PolicyDecider.class);
+
+    /** 时间段判定固定用北京时间, 不依赖网关 JVM 的默认时区 (可能跑在 UTC 容器里) */
+    private static final ZoneId BUSINESS_ZONE = ZoneId.of("Asia/Shanghai");
+
+    private static final DateTimeFormatter TIME_FORMATTER =
+            DateTimeFormatter.ofPattern("HH:mm:ss").withResolverStyle(ResolverStyle.STRICT);
+    private static final DateTimeFormatter DATE_TIME_FORMATTER =
+            DateTimeFormatter.ofPattern("uuuu-MM-dd HH:mm:ss").withResolverStyle(ResolverStyle.STRICT);
 
     /** 复合语法与重定向: 一条命令里出现即不许白名单自动放行 */
     private static final Pattern COMPOUND = Pattern.compile("[;&|`$()<>\\r\\n]");
@@ -140,6 +159,11 @@ public class PolicyDecider {
      * @param command   原始命令串
      */
     public Decision decide(long agentId, String hostType, Long hostId, String command) {
+        return decide(agentId, hostType, hostId, command, ZonedDateTime.now(BUSINESS_ZONE));
+    }
+
+    /** 包级重载: 测试可传入固定时刻, 稳定覆盖时间段跨边界行为 */
+    Decision decide(long agentId, String hostType, Long hostId, String command, ZonedDateTime now) {
         if (store.unavailable()) {
             return Decision.of(Kind.DENY, "访问控制策略源不可用, 已暂停命令执行", null);
         }
@@ -147,9 +171,9 @@ public class PolicyDecider {
             return Decision.of(Kind.DENY, "无法确定目标资源, 不能按策略放行", null);
         }
         List<PolicyStore.Policy> policies = store.snapshot().policies();
-        List<PolicyStore.Policy> applicable = applicable(policies, agentId, hostType, hostId);
+        List<PolicyStore.Policy> applicable = applicable(policies, agentId, hostType, hostId, now);
         // 限流单独一套: 它不参与黑白名单匹配, 但同样要按智能体/资源定范围
-        List<PolicyStore.Policy> rates = ratePolicies(policies, agentId, hostType, hostId);
+        List<PolicyStore.Policy> rates = ratePolicies(policies, agentId, hostType, hostId, now);
         // 无效优先: 规则读不出来的策略不能当"没有这条策略"跳过 —— 丢掉的可能是 deny 项,
         // 后面再有一条白名单命中就变成放行了 (设计文档: 无效规则按拒绝处理)
         for (PolicyStore.Policy p : applicable) {
@@ -236,10 +260,10 @@ public class PolicyDecider {
      * 算进去的话, 只配了限流、没配黑白名单的智能体, 每条命令都会落进严格模式被拒.
      * <b>但规则无效的限流要留下</b> —— 无效规则按拒绝处理 (结论 17), 排除了就成了静默忽略
      */
-    private static List<PolicyStore.Policy> applicable(List<PolicyStore.Policy> all, long agentId, String hostType, long hostId) {
+    private static List<PolicyStore.Policy> applicable(List<PolicyStore.Policy> all, long agentId, String hostType, long hostId, ZonedDateTime now) {
         List<PolicyStore.Policy> out = new ArrayList<>();
         for (PolicyStore.Policy p : all) {
-            if (!inScope(p, agentId, hostType, hostId)) {
+            if (!inScope(p, agentId, hostType, hostId, now)) {
                 continue;
             }
             if (PolicyStore.TYPE_RATE_LIMIT.equals(p.type()) && !p.rulesInvalid()) {
@@ -251,23 +275,87 @@ public class PolicyDecider {
     }
 
     /** 有效限流适用集: 逐条按其自己的窗口记账, 命中任一条超限即拒 */
-    private static List<PolicyStore.Policy> ratePolicies(List<PolicyStore.Policy> all, long agentId, String hostType, long hostId) {
+    private static List<PolicyStore.Policy> ratePolicies(List<PolicyStore.Policy> all, long agentId, String hostType, long hostId, ZonedDateTime now) {
         List<PolicyStore.Policy> out = new ArrayList<>();
         for (PolicyStore.Policy p : all) {
-            if (PolicyStore.TYPE_RATE_LIMIT.equals(p.type()) && !p.rulesInvalid() && inScope(p, agentId, hostType, hostId)) {
+            if (PolicyStore.TYPE_RATE_LIMIT.equals(p.type()) && !p.rulesInvalid() && inScope(p, agentId, hostType, hostId, now)) {
                 out.add(p);
             }
         }
         return out;
     }
 
-    /** 策略是否管这次调用: 智能体匹配 (0=全部), 且 (全局且类型匹配) 或 (指定该资源) */
-    private static boolean inScope(PolicyStore.Policy p, long agentId, String hostType, long hostId) {
+    /**
+     * 策略是否管这次调用: 智能体匹配 (0=全部), 且 (全局且类型匹配) 或 (指定该资源), 且时间段适用
+     * <p>
+     * now 作为参数传入 (而不是在方法内部取当前时间): 一次判定内所有策略共用同一个时刻, 避免同一次裁决
+     * 出现"有的策略按 17:59 判、有的按 18:00 判"; 同时让时间判定变成纯函数, 可测
+     */
+    private static boolean inScope(PolicyStore.Policy p, long agentId, String hostType, long hostId, ZonedDateTime now) {
         if (p.agentId() != 0 && p.agentId() != agentId) {
             return false;
         }
         boolean global = p.hostId() == 0 && p.hostType() != null && p.hostType().equals(hostType);
-        return global || p.hostId() == hostId;
+        if (!(global || p.hostId() == hostId)) {
+            return false;
+        }
+        // 时间段: 与 agentId/hostId 同层, 不匹配 = 这条策略不适用 (不是"拒绝")
+        return inTimeScope(p, now);
+    }
+
+    /**
+     * 判断"这次调用的时间是否落在该策略的时段内".
+     * <p>
+     * 三种情况必须区分清楚:
+     * <ul>
+     *   <li>合法且匹配 → true (策略适用)</li>
+     *   <li>合法但不匹配 → false (策略不适用, 移出 applicable —— 这是正常语义)</li>
+     *   <li><b>非法 (格式坏 / 空窗口 / 反向区间) → true</b>: 不能返回 false.
+     *       返回 false 会让策略被移出 applicable, 从而绕过 rulesInvalid 检查变成"静默丢弃"</li>
+     * </ul>
+     */
+    private static boolean inTimeScope(PolicyStore.Policy p, ZonedDateTime now) {
+        String type = p.actionTimeType();
+        if ("1".equals(type)) {
+            return true;
+        }
+        // 值域外的 type (含 null) 一律视为非法: 返回 true 留待 rulesInvalid 拒绝.
+        // PolicyStore 已保证走到这里的 type 非 null (缺失折成 "1"、非法值直接抛异常),
+        // 这里不做 null → "1" 的兜底, 避免漏进的非法 null 静默变成全天生效
+        if (!"0".equals(type) && !"2".equals(type)) {
+            return true;
+        }
+        try {
+            if ("0".equals(type)) {
+                LocalTime start = LocalTime.parse(p.actionTimeStart(), TIME_FORMATTER);
+                LocalTime end = LocalTime.parse(p.actionTimeEnd(), TIME_FORMATTER);
+                if (start.equals(end)) {
+                    // 空窗口: 语义非法. 返回 true 留待 rulesInvalid 拒绝
+                    return true;
+                }
+                // 截断到秒: now 带纳秒, 而解析出的边界纳秒为 0 —— 不截断的话 18:00:00.500 已经
+                // isAfter(18:00:00), 闭区间的"结束那一秒"只剩 .000 一个瞬间
+                LocalTime t = now.toLocalTime().truncatedTo(ChronoUnit.SECONDS);
+                // 跨天: 22:00~06:00 表示 now >= 22:00 或 now <= 06:00
+                return start.isAfter(end)
+                        ? (!t.isBefore(start) || !t.isAfter(end))
+                        : (!t.isBefore(start) && !t.isAfter(end));
+            }
+            // type=2: 指定绝对时间范围 (单次窗口, 过期后自然不再匹配)
+            LocalDateTime start = LocalDateTime.parse(p.actionTimeStart(), DATE_TIME_FORMATTER);
+            LocalDateTime end = LocalDateTime.parse(p.actionTimeEnd(), DATE_TIME_FORMATTER);
+            if (!start.isBefore(end)) {
+                // 反向/零长绝对区间: 语义非法. 同样返回 true 留待 rulesInvalid 拒绝
+                return true;
+            }
+            LocalDateTime t = now.toLocalDateTime().truncatedTo(ChronoUnit.SECONDS);
+            return !t.isBefore(start) && !t.isAfter(end);
+        } catch (Exception e) {
+            // 格式非法 (PolicyStore 已把这类策略标成 rulesInvalid) → 返回 true 让它留在 applicable 里
+            // 被 rulesInvalid 拦下拒绝. 这是预期路径而不是"理论上不可达"
+            log.warn("策略时间字段解析失败, 交由 rulesInvalid 处理: id={} err={}", p.id(), e.toString());
+            return true;
+        }
     }
 
     /**
@@ -278,10 +366,15 @@ public class PolicyDecider {
      * 情况会多计一次, 是刻意接受的小偏差 (反向"预留再回退"会引入配额泄漏, 更糟)
      */
     public void recordRate(long agentId, String hostType, Long hostId) {
+        recordRate(agentId, hostType, hostId, ZonedDateTime.now(BUSINESS_ZONE));
+    }
+
+    /** 包级重载: 同样供测试注入时刻 */
+    void recordRate(long agentId, String hostType, Long hostId, ZonedDateTime now) {
         if (hostId == null) {
             return;
         }
-        for (PolicyStore.Policy p : ratePolicies(store.snapshot().policies(), agentId, hostType, hostId)) {
+        for (PolicyStore.Policy p : ratePolicies(store.snapshot().policies(), agentId, hostType, hostId, now)) {
             limiter.record(p.id(), p.windowSeconds());
         }
     }
@@ -528,7 +621,12 @@ public class PolicyDecider {
         StringBuilder canonical = new StringBuilder();
         for (PolicyStore.Policy p : sorted) {
             canonical.append(p.id()).append('|').append(p.type()).append('|')
-                    .append(p.approvalMode()).append('|').append(p.rulesInvalid()).append('|');
+                    .append(p.approvalMode()).append('|').append(p.rulesInvalid()).append('|')
+                    // 时间段字段必须算进摘要: 否则改了时间段、快照重拉、新策略生效, 但审批中的旧凭证
+                    // 消费时 policyRevision 仍是旧值, 会被误接受
+                    .append(p.actionTimeType()).append('|')
+                    .append(p.actionTimeStart() == null ? "" : p.actionTimeStart()).append('|')
+                    .append(p.actionTimeEnd() == null ? "" : p.actionTimeEnd()).append('|');
             for (PolicyStore.Op op : p.ops()) {
                 // （对 Codex 评审的修订）op.value() 是管理员填的任意正则/关键字文本, 可能自带 ':' ';' 这类
                 // 分隔符——直接拼接不是单射: 一条 REGEX 值 "x;KEYWORD:y" 和两条 {REGEX,"x"}+{KEYWORD,"y"}

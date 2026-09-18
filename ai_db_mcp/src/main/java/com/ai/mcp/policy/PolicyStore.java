@@ -8,6 +8,10 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.stereotype.Component;
 
+import java.time.LocalDateTime;
+import java.time.LocalTime;
+import java.time.format.DateTimeFormatter;
+import java.time.format.ResolverStyle;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
@@ -46,6 +50,17 @@ public class PolicyStore {
     /** 操作项匹配方式的值域; 未知值在 {@code PolicyDecider.governs} 的 switch 里落到 default → 静默不匹配 */
     private static final Set<String> OP_MATCH_TYPES = Set.of("EXACT", "KEYWORD", REGEX);
 
+    /** 时间段控制类型值域: 1全天 0每天固定时段 2指定时间范围段 */
+    private static final Set<String> ACTION_TIME_TYPES = Set.of("1", "0", "2");
+
+    // 严格解析: 不用默认的 SMART 模式, 否则非法日期可能被自动归整而"看着解析成功";
+    // 必须用 uuuu 而不是 yyyy —— 后者是 year-of-era, STRICT 模式下缺 era 字段会直接抛异常,
+    // 导致所有合法的 type=2 时间都被判非法 (已用 JDK 实测确认)
+    private static final DateTimeFormatter TIME_FORMATTER =
+            DateTimeFormatter.ofPattern("HH:mm:ss").withResolverStyle(ResolverStyle.STRICT);
+    private static final DateTimeFormatter DATE_TIME_FORMATTER =
+            DateTimeFormatter.ofPattern("uuuu-MM-dd HH:mm:ss").withResolverStyle(ResolverStyle.STRICT);
+
     /** 一条操作项: 命令标识 + 匹配方式 (EXACT/KEYWORD/REGEX) */
     public record Op(String value, String matchType) {
     }
@@ -58,10 +73,15 @@ public class PolicyStore {
      * @param rulesSummary 规则内容摘要 (展示用, 不参与裁决/policyRevision); 规则无效时为 null
      * @param limit        仅 RATE_LIMIT: 窗口内次数上限 (有效的限流策略必填, 缺了整次拉取算失败)
      * @param windowSeconds 仅 RATE_LIMIT: 窗口长度 (秒); 非限流类恒 0, 不参与裁决
+     * @param actionTimeType  时间段控制: 1全天 0每天固定时段 2指定时间范围段; 缺失字段折成 "1", 存在但非法直接 fetch() 失败
+     * @param actionTimeStart 起始时间原值 (可能为 null); type=0 为 HH:mm:ss, type=2 为 uuuu-MM-dd HH:mm:ss;
+     *                        非法值不在此处兜底, 交给 {@code PolicyDecider.inTimeScope()} 解析失败 → rulesInvalid 拒绝
+     * @param actionTimeEnd   结束时间原值, 格式同 actionTimeStart
      */
     public record Policy(long id, String name, String type, String hostType, long hostId, long agentId,
                          String approvalMode, boolean rulesInvalid, String rulesSummary, List<Op> ops,
-                         long limit, long windowSeconds) {
+                         long limit, long windowSeconds,
+                         String actionTimeType, String actionTimeStart, String actionTimeEnd) {
     }
 
     public record Snapshot(String version, List<Policy> policies) {
@@ -129,7 +149,8 @@ public class PolicyStore {
         }
     }
 
-    private Snapshot fetch(String version) throws Exception {
+    /** 包级可见: 允许同包单测直接灌快照数据校验值域/格式, 不必绕心跳 (照 ConsoleClient.applyAuth 同款先例) */
+    Snapshot fetch(String version) throws Exception {
         Map<String, Object> data = console.policySnapshot();
         JsonNode root = json.valueToTree(data);
         JsonNode list = root.path("policies");
@@ -158,6 +179,27 @@ public class PolicyStore {
             }
             String type = p.path("type").asText("");
             boolean invalid = p.path("rulesInvalid").asBoolean(false);
+            // 时间段控制: path() 对不存在的字段返回 MissingNode —— 老控制台的快照条目根本没有这三个属性.
+            // 老控制台的真实形态是三字段**全部**缺失; "type 缺失但 start/end 存在"这种混合形态只可能是
+            // 控制台侧序列化/映射 bug (新控制台受 @JsonInclude(ALWAYS) 约束三字段要么全出现要么全不出现),
+            // 必须硬失败而不是兼容成全天
+            JsonNode timeTypeNode = p.path("actionTimeType");
+            JsonNode timeStartNode = p.path("actionTimeStart");
+            JsonNode timeEndNode = p.path("actionTimeEnd");
+            String actionTimeType;
+            if (timeTypeNode.isMissingNode() && timeStartNode.isMissingNode() && timeEndNode.isMissingNode()) {
+                actionTimeType = "1";                      // 老控制台: 按全天处理 (网关先上线时的兼容路径)
+            } else if (!timeTypeNode.isTextual() || !ACTION_TIME_TYPES.contains(timeTypeNode.asText())) {
+                // 存在但非法 (含显式 JSON null、空串、数字、布尔、未知文本、混合缺失形态) —— 全部硬失败
+                throw new IllegalStateException("策略快照条目的 actionTimeType 不在值域内: " + p);
+            } else {
+                actionTimeType = timeTypeNode.asText();
+            }
+            // 时间字段非法 (不能解析/区间反了/起止相等) 的策略, 也按"规则无效"处理:
+            // 不能静默丢弃(弱化黑名单)、不能让整条快照失败(代价过大)、不能当全天生效(fail-open)
+            if (!actionTimeValid(actionTimeType, p)) {
+                invalid = true;
+            }
             // 限流也一样: 缺 limit/windowSeconds 会被读成「不限」, 等于限流静默失效
             if (TYPE_RATE_LIMIT.equals(type) && !invalid
                     && !(p.path("limit").isNumber() && p.path("windowSeconds").isNumber())) {
@@ -198,11 +240,18 @@ public class PolicyStore {
             }
             // rulesSummary 展示用可空 (规则无效时控制台本就不下发有意义的摘要), 不必牵连整次拉取失败
             String rulesSummary = p.path("rulesSummary").isTextual() ? p.path("rulesSummary").asText() : null;
+            // actionTimeStart/End 保留**原值**(可能为 null): 非法的那些已由 actionTimeValid 标成 invalid,
+            // 保留原值可以让 Decider 的解析失败走 catch → return true → 交由 rulesInvalid 拒绝.
+            // 不要把非法策略的 actionTimeType 折成 "1" —— 那样 inTimeScope() 会直接放行该策略(全天),
+            // 整条 fail-closed 链路失效
             policies.add(new Policy(p.path("id").asLong(), p.path("name").asText(), type, p.path("hostType").asText(""),
                     p.path("hostId").asLong(), p.path("agentId").asLong(),
                     p.path("approvalMode").asText("NONE"), invalid, rulesSummary,
                     List.copyOf(ops),
-                    p.path("limit").asLong(), p.path("windowSeconds").asLong()));
+                    p.path("limit").asLong(), p.path("windowSeconds").asLong(),
+                    actionTimeType,
+                    timeStartNode.isTextual() ? timeStartNode.asText() : null,
+                    timeEndNode.isTextual() ? timeEndNode.asText() : null));
         }
         return new Snapshot(version, List.copyOf(policies));
     }
@@ -219,6 +268,32 @@ public class PolicyStore {
             Pattern.compile(regex);
             return true;
         } catch (PatternSyntaxException e) {
+            return false;
+        }
+    }
+
+    /**
+     * type=0 要求两个合法 HH:mm:ss 且不相等 (跨天合法, 方向不在这里判, 交给 PolicyDecider.inTimeScope());
+     * type=2 要求两个合法 uuuu-MM-dd HH:mm:ss 且 start < end; type=1 不看时间字段
+     */
+    private static boolean actionTimeValid(String type, JsonNode p) {
+        if ("1".equals(type)) {
+            return true;
+        }
+        String startRaw = p.path("actionTimeStart").asText(null);
+        String endRaw = p.path("actionTimeEnd").asText(null);
+        try {
+            if ("0".equals(type)) {
+                LocalTime start = LocalTime.parse(startRaw, TIME_FORMATTER);
+                LocalTime end = LocalTime.parse(endRaw, TIME_FORMATTER);
+                // start == end 是空窗口 (无意义配置), 按非法处理
+                return !start.equals(end);
+            }
+            LocalDateTime start = LocalDateTime.parse(startRaw, DATE_TIME_FORMATTER);
+            LocalDateTime end = LocalDateTime.parse(endRaw, DATE_TIME_FORMATTER);
+            // 绝对区间必须正向; 反向/零长区间是配置错误
+            return start.isBefore(end);
+        } catch (Exception e) {
             return false;
         }
     }
