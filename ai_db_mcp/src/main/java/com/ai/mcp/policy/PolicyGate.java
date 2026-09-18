@@ -35,14 +35,6 @@ public class PolicyGate {
     private static final Logger log = LoggerFactory.getLogger(PolicyGate.class);
 
     /**
-     * 确认超时: 超时按拒绝处理, 否则客户端不响应会永久占住线程
-     * <p>
-     * 必须小于 spring.ai.mcp.server.request-timeout (默认 20s!): SDK 用它限出站请求,
-     * 配小了就是 SDK 先抛异常, 这里成了死代码. application.yml 里已调到 130s
-     */
-    private static final long CONFIRM_TIMEOUT_SEC = 120;
-
-    /**
      * 确认等待是有界的: 16 路并发, 队列再攒 32 个, 之后直接拒绝
      * <p>
      * 不用 Executors.newFixedThreadPool —— 它的队列是无界的, submit 永远不会被拒, 池满只会无限积压
@@ -87,7 +79,7 @@ public class PolicyGate {
         }
         Decision verdict = confirm(exchange, command, decision);
         if (verdict.kind() == Kind.ALLOW) {
-            // 用户已同意, 但等待期间(最长 120 秒)策略可能已经变严 —— 只信旧判定就可能放行一条
+            // 用户已同意, 但等待期间(最长按控制台下发的确认超时)策略可能已经变严 —— 只信旧判定就可能放行一条
             // 已被新策略拒绝(甚至改成要管理员审批)的命令。用当前快照重新裁决一次:
             // 只在新结果比"确认放行"更严 (DENY/APPROVAL) 时才收回旧许可; 新结果仍是 ALLOW/CONFIRM
             // 说明许可没被削弱, 不用为同一件事再弹一次窗 (那样会形成确认死循环)
@@ -110,7 +102,7 @@ public class PolicyGate {
     /**
      * 审批闸门 (第二部分): decide() 判定为 APPROVAL 时走这里, 立即返回 (不阻塞等待, 设计文档结论 1)——
      * 不占 CONFIRM_POOL, 这是一次短 HTTP 调用 (ConsoleClient 的 readTimeout 是 10s), 不是可能阻塞
-     * 120 秒的 elicitation
+     * 数十至数百秒 (控制台下发, 最长 300 秒) 的 elicitation
      */
     private Decision approval(McpTransportContext ctx, Decision decision, String tool, String command, ConsoleClient.Resolved cred) {
         ConsoleClient.ResolvedUser identity = McpRequestFilter.userIdentity(ctx);
@@ -238,13 +230,14 @@ public class PolicyGate {
         } catch (Exception e) {
             return Decision.confirm(Kind.DENY, "二次确认通道繁忙, 已拒绝执行", decision.policyLabel());
         }
+        int timeout = console.confirmTimeoutSeconds();
         try {
-            result = future.get(CONFIRM_TIMEOUT_SEC, TimeUnit.SECONDS);
+            result = future.get(timeout, TimeUnit.SECONDS);
         } catch (java.util.concurrent.TimeoutException e) {
             // 超时: 撤掉等待, 但底层请求可能仍挂在客户端 — 由会话关闭或客户端作答回收
             future.cancel(true);
             log.info("二次确认超时 policy={} command={}", decision.policyLabel(), command);
-            return Decision.confirm(Kind.DENY, "二次确认超时 (" + CONFIRM_TIMEOUT_SEC + " 秒), 已拒绝执行", decision.policyLabel());
+            return Decision.confirm(Kind.DENY, "二次确认超时 (" + timeout + " 秒), 已拒绝执行", decision.policyLabel());
         } catch (InterruptedException e) {
             Thread.currentThread().interrupt();
             return Decision.confirm(Kind.DENY, "二次确认被中断, 已拒绝执行", decision.policyLabel());

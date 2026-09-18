@@ -78,6 +78,13 @@ public class ConsoleClient {
     private volatile String authToken;
     // 控制台下发的单节点 QPS 配额, 0=不限; 秒级固定窗计数器: 高 32 位窗口秒 + 低 32 位计数
     private volatile int maxQps;
+    /** 确认超时兜底默认 (字段缺失但从未收到过合法值时 / 首次心跳前) */
+    public static final int DEFAULT_CONFIRM_TIMEOUT_SEC = 120;
+    /** 值域, 与控制台侧保持一致; 网关不假设控制台一定校验过 (信任边界) */
+    public static final int MIN_CONFIRM_TIMEOUT_SEC = 10;
+    public static final int MAX_CONFIRM_TIMEOUT_SEC = 300;
+    /** 控制台下发的二次确认超时(秒); 心跳线程写、业务线程读, volatile 足够 */
+    private volatile int confirmTimeoutSeconds = DEFAULT_CONFIRM_TIMEOUT_SEC;
     private final AtomicLong qpsWindow = new AtomicLong();
     /** 限流窗只做相邻比较, 用单调时钟: 墙钟被 NTP 回拨时按秒差会一直落在旧窗内, 配额耗尽后持续 429 */
     private static final long NANO_BASE = System.nanoTime();
@@ -351,17 +358,40 @@ public class ConsoleClient {
         return (Map<String, Object>) checkedData(signedPost("/agent/gateway/opt/policy-snapshot", Map.of()));
     }
 
-    private void applyAuth(Map<String, Object> data) {
+    /** package-private: 允许同包单测直接灌数据, 不必绕 HTTP */
+    void applyAuth(Map<String, Object> data) {
         authType = (String) data.get("authType");
         authToken = (String) data.get("authToken");
         maxQps = intOf(data.get("maxQps"));
         IdleReaper.setMaxConnections(intOf(data.get("maxConnections")));
         IdleReaper.setMaxResourceConnections(intOf(data.get("maxResourceConnections")));
+        // 缺字段(旧控制台)保持当前缓存 —— 不能重置为默认值: 新旧控制台实例混部或回滚时,
+        // 网关会在"已配置值"和 120 之间来回振荡
+        if (data.containsKey("confirmTimeoutSeconds")) {
+            Long confirm = exactLong(data.get("confirmTimeoutSeconds"));
+            // 字段存在但非法一律回落默认。
+            // 顺序是"先确认是无小数、未溢出的整数, 再判范围" —— 不能直接走 intOf 的
+            // Number.intValue(): 它会把 10.9 截断成 10、超大整数溢出后落进合法区间,
+            // 那样"完整校验"就是假的
+            confirmTimeoutSeconds = (confirm != null
+                    && confirm >= MIN_CONFIRM_TIMEOUT_SEC && confirm <= MAX_CONFIRM_TIMEOUT_SEC)
+                    ? confirm.intValue() : DEFAULT_CONFIRM_TIMEOUT_SEC;
+        }
     }
 
     /** 控制台未配置该限额时下发 null, 统一折成 0 (不限) */
     private static int intOf(Object v) {
         return v instanceof Number n ? n.intValue() : 0;
+    }
+
+    /** 只接受 JSON 整数(Jackson 默认映射为 Integer/Long); 小数(Double)与超 long(BigInteger) 一律当非法 */
+    private static Long exactLong(Object v) {
+        return (v instanceof Integer || v instanceof Long) ? ((Number) v).longValue() : null;
+    }
+
+    /** 控制台下发的二次确认超时(秒), 供 {@link com.ai.mcp.policy.PolicyGate} 每次确认时读取 */
+    public int confirmTimeoutSeconds() {
+        return confirmTimeoutSeconds;
     }
 
     /**

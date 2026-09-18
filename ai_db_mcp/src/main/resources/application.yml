@@ -9,9 +9,12 @@ spring:
       server:
         # STREAMABLE: 协议级二次确认需要会话对象; 回退改回 STATELESS 即可 (CONFIRM 会退化为一律拒绝)
         protocol: STREAMABLE
-        # 必须大于 PolicyGate.CONFIRM_TIMEOUT_SEC(120s): SDK 用它限服务端→客户端请求(含 elicitation),
-        # 默认 20s 会让等确认的调用 20 秒就抛"二次确认失败", 闸门那 120 秒永远走不到
-        request-timeout: 130s
+        # 语义已变: 不再是"跟某个确认超时绑定的值", 而是天花板。
+        # SDK 用它限服务端→客户端请求(含 elicitation); 实际确认超时由控制台下发
+        # (默认 120, 上限 300), 必须严格小于本值 —— 取 330 只留小余量:
+        # 同一个 sendRequest() 还承载 sampling/createMessage, roots/list, ping,
+        # 放宽太多会把那些请求的故障发现时间也无谓拉长
+        request-timeout: 330s
         name: AI MCP Server
         instructions: "提供数据库连接管理和远程主机SSH连接功能。支持创建和管理数据库连接、执行SQL语句、事务处理，以及SSH连接到远程主机执行命令。"
         annotation-scanner:

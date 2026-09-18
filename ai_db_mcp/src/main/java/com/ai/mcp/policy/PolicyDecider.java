@@ -68,7 +68,7 @@ public class PolicyDecider {
 
     /**
      * @param policyLabel     命中的策略 (供弹窗与审计展示); 未命中任何策略时为 null
-     * @param confirmWaited   这次判定在人工确认/审批闸门上阻塞过 (最长 CONFIRM_TIMEOUT_SEC 秒, 或 /gate 的 HTTP 往返):
+     * @param confirmWaited   这次判定在人工确认/审批闸门上阻塞过 (最长按控制台下发的确认超时, 或 /gate 的 HTTP 往返):
      *                        等待期间凭据可能已被管理员撤销/过期, 调用方用句柄前必须重校验授权
      * @param source          判定来源, 决定审计里归到哪一类拒绝
      * @param policyRevision  仅 decide() 判定为 APPROVAL 时有值: 这次裁决实际命中的策略内容摘要 (设计文档 §2.1a),
@@ -152,7 +152,7 @@ public class PolicyDecider {
                 return Decision.of(Kind.DENY, "命中策略规则无效, 已按拒绝处理", label(List.of(p)));
             }
         }
-        // 限流快速检查放在弹窗之前: 超限直接拒, 不去打扰用户点确认 (确认最长要等 120 秒)
+        // 限流快速检查放在弹窗之前: 超限直接拒, 不去打扰用户点确认 (确认最长要等控制台下发的确认超时, 至多 300 秒)
         for (PolicyStore.Policy p : rates) {
             if (limiter.exceeded(p.id(), p.limit(), p.windowSeconds())) {
                 return Decision.of(Kind.DENY,
