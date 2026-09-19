@@ -68,6 +68,8 @@ public class PolicyStore {
     /**
      * 一条启用中的 HOST 类策略; type=RATE_LIMIT 的不参与黑白名单匹配 (见 {@code PolicyDecider.applicable})
      *
+     * @param hostIds      目标资源 id 集合; 单元素 {@code [0]} 是「该 hostType 下全部资源」的哨兵.
+     *                     非空, 且 0 不与具体 id 混排 (解析期已保证, 见 {@code fetch})
      * @param name         策略名称 (管理员填写, 展示用, 不参与裁决/policyRevision)
      * @param rulesInvalid 控制台判定规则无效 (存量/人工导入的坏行); 该策略适用范围内一律拒绝, 不当无策略跳过
      * @param rulesSummary 规则内容摘要 (展示用, 不参与裁决/policyRevision); 规则无效时为 null
@@ -78,7 +80,7 @@ public class PolicyStore {
      *                        非法值不在此处兜底, 交给 {@code PolicyDecider.inTimeScope()} 解析失败 → rulesInvalid 拒绝
      * @param actionTimeEnd   结束时间原值, 格式同 actionTimeStart
      */
-    public record Policy(long id, String name, String type, String hostType, long hostId, long agentId,
+    public record Policy(long id, String name, String type, String hostType, List<Long> hostIds, long agentId,
                          String approvalMode, boolean rulesInvalid, String rulesSummary, List<Op> ops,
                          long limit, long windowSeconds,
                          String actionTimeType, String actionTimeStart, String actionTimeEnd) {
@@ -149,7 +151,13 @@ public class PolicyStore {
         }
     }
 
-    /** 包级可见: 允许同包单测直接灌快照数据校验值域/格式, 不必绕心跳 (照 ConsoleClient.applyAuth 同款先例) */
+    /**
+     * 包级可见: 允许同包单测直接灌快照数据校验值域/格式, 不必绕心跳 (照 ConsoleClient.applyAuth 同款先例)
+     * <p>
+     * 快照标签必须用响应自身的 version, 不能用心跳传来的 {@code version} 参数: 心跳报 C 而快照接口因读库延迟/
+     * 回滚返回的仍是 B 时代的内容时, 若贴上 C, 此后 {@code version.equals(snapshot.version())} 恒真, 网关会
+     * 永久坐在 B 的内容上不再重拉; 同理 B→C→B 回环也会卡住. 贴响应自身的 version 则下一次心跳即发现不等而重拉, 自愈
+     */
     Snapshot fetch(String version) throws Exception {
         Map<String, Object> data = console.policySnapshot();
         JsonNode root = json.valueToTree(data);
@@ -159,15 +167,23 @@ public class PolicyStore {
         if (!list.isArray()) {
             throw new IllegalStateException("策略快照响应缺少 policies 数组");
         }
+        // 照缺 policies 同款: 响应结构不对就当拉取失败, 不能拿心跳报的版本号凑一个标签
+        JsonNode versionNode = root.path("version");
+        if (!versionNode.isTextual() || versionNode.asText().isBlank()) {
+            throw new IllegalStateException("策略快照响应缺少 version");
+        }
         List<Policy> policies = new ArrayList<>();
         for (JsonNode p : list) {
             // 作用域字段必须齐全: asLong() 对缺字段/ null / 类型不对都静默给 0, 而 0 是「全部智能体 /
             // 全部资源」的哨兵 —— 一条本该只管某个智能体的策略会变成管所有智能体, 这是放大授权.
             // 结构不对就当整次拉取失败 (fail-closed), 不能跳过坏条目: 跳过一条黑名单等于弱化它
-            if (!p.path("id").isNumber() || !p.path("type").isTextual() || !p.path("hostType").isTextual()
-                    || !p.path("hostId").isNumber() || !p.path("agentId").isNumber()) {
+            // isNumber() 不够: 12.9 会被 asLong() 截成 12、超 long 的整数会溢出成另一个真实 id,
+            // 都等于"悄悄换了一条策略的作用域". 必须是无小数、未溢出的整数
+            if (!isExactLong(p.path("id")) || !p.path("type").isTextual() || !p.path("hostType").isTextual()
+                    || !isExactLong(p.path("agentId"))) {
                 throw new IllegalStateException("策略快照条目缺少作用域字段: " + p);
             }
+            List<Long> hostIds = parseHostIds(p);
             // name 展示用但要求非空: 控制台表结构本就 NOT NULL, 缺失说明快照结构不对, 同一套 fail-closed 口径
             if (!p.path("name").isTextual() || p.path("name").asText().isBlank()) {
                 throw new IllegalStateException("策略快照条目缺少 name: " + p);
@@ -245,7 +261,7 @@ public class PolicyStore {
             // 不要把非法策略的 actionTimeType 折成 "1" —— 那样 inTimeScope() 会直接放行该策略(全天),
             // 整条 fail-closed 链路失效
             policies.add(new Policy(p.path("id").asLong(), p.path("name").asText(), type, p.path("hostType").asText(""),
-                    p.path("hostId").asLong(), p.path("agentId").asLong(),
+                    hostIds, p.path("agentId").asLong(),
                     p.path("approvalMode").asText("NONE"), invalid, rulesSummary,
                     List.copyOf(ops),
                     p.path("limit").asLong(), p.path("windowSeconds").asLong(),
@@ -253,7 +269,37 @@ public class PolicyStore {
                     timeStartNode.isTextual() ? timeStartNode.asText() : null,
                     timeEndNode.isTextual() ? timeEndNode.asText() : null));
         }
-        return new Snapshot(version, List.copyOf(policies));
+        return new Snapshot(versionNode.asText(), List.copyOf(policies));
+    }
+
+    /** JSON 数字是否是无小数、未溢出的整数; isNumber()+asLong() 会把 12.9 截成 12、把超 long 溢出成另一个 id */
+    private static boolean isExactLong(JsonNode n) {
+        return n.isIntegralNumber() && n.canConvertToLong();
+    }
+
+    /**
+     * 目标资源集合: 必须是非空数组, 每个元素都是 >=0 的精确整数; 0 是「全部资源」哨兵, 只许独占整个数组
+     * <p>
+     * 缺失/非数组/空数组都不能折成"全部"或"跳过这条策略" —— 0 是放大授权, 跳过则是弱化黑名单.
+     * 一律按整次拉取失败处理 (fail-closed, 沿用旧快照, 连失 3 次退到不可用全拒)
+     */
+    private static List<Long> parseHostIds(JsonNode p) {
+        JsonNode node = p.path("hostIds");
+        if (!node.isArray() || node.isEmpty()) {
+            throw new IllegalStateException("策略快照条目的 hostIds 非法: " + p);
+        }
+        List<Long> ids = new ArrayList<>(node.size());
+        for (JsonNode e : node) {
+            if (!isExactLong(e) || e.asLong() < 0) {
+                throw new IllegalStateException("策略快照条目的 hostIds 非法: " + p);
+            }
+            ids.add(e.asLong());
+        }
+        // [0, 12] 这种混排语义不明 (是全部还是只有 12?), 控制台侧不该产出; 按哨兵解读就是放大授权
+        if (ids.contains(0L) && ids.size() > 1) {
+            throw new IllegalStateException("策略快照条目的 hostIds 非法: " + p);
+        }
+        return List.copyOf(ids);
     }
 
     /**

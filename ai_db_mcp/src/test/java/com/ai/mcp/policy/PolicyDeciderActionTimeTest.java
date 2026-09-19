@@ -41,7 +41,7 @@ class PolicyDeciderActionTimeTest {
 
     private static PolicyDecider newDecider(List<Map<String, Object>> policies) {
         FakeConsoleClient console = new FakeConsoleClient();
-        console.data = Map.of("policies", policies);
+        console.data = Map.of("version", "v1", "policies", policies);
         PolicyStore store = new PolicyStore(console, new ObjectMapper());
         store.register();
         console.captured.onReport("v1");
@@ -55,7 +55,7 @@ class PolicyDeciderActionTimeTest {
         p.put("name", "wl-" + id);
         p.put("type", PolicyStore.TYPE_WHITELIST);
         p.put("hostType", "SSH");
-        p.put("hostId", 0);
+        p.put("hostIds", List.of(0));
         p.put("agentId", 0);
         p.put("approvalMode", "NONE");
         p.put("rulesInvalid", false);
@@ -161,7 +161,7 @@ class PolicyDeciderActionTimeTest {
         p.put("name", "rate-1");
         p.put("type", PolicyStore.TYPE_RATE_LIMIT);
         p.put("hostType", "SSH");
-        p.put("hostId", 0);
+        p.put("hostIds", List.of(0));
         p.put("agentId", 0);
         p.put("approvalMode", "NONE");
         p.put("rulesInvalid", false);

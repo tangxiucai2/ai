@@ -295,8 +295,8 @@ public class PolicyDecider {
         if (p.agentId() != 0 && p.agentId() != agentId) {
             return false;
         }
-        boolean global = p.hostId() == 0 && p.hostType() != null && p.hostType().equals(hostType);
-        if (!(global || p.hostId() == hostId)) {
+        boolean global = p.hostIds().contains(0L) && p.hostType() != null && p.hostType().equals(hostType);
+        if (!(global || p.hostIds().contains(hostId))) {
             return false;
         }
         // 时间段: 与 agentId/hostId 同层, 不匹配 = 这条策略不适用 (不是"拒绝")

@@ -35,7 +35,7 @@ class PolicyStoreActionTimeTest {
         p.put("name", "测试策略" + id);
         p.put("type", PolicyStore.TYPE_WHITELIST);
         p.put("hostType", "SSH");
-        p.put("hostId", 0);
+        p.put("hostIds", List.of(0));
         p.put("agentId", 0);
         p.put("approvalMode", "NONE");
         p.put("rulesInvalid", false);
@@ -44,7 +44,8 @@ class PolicyStoreActionTimeTest {
     }
 
     private static Map<String, Object> snapshot(Map<String, Object> policy) {
-        return Map.of("policies", List.of(policy));
+        // version 必填: fetch() 用响应自身的 version 给快照贴标签
+        return Map.of("version", "v-resp", "policies", List.of(policy));
     }
 
     // 1. 缺字段兼容: 老控制台快照(三字段全缺) → 按 "1" 全天, 不抛异常
