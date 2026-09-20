@@ -172,8 +172,9 @@ public class PolicyDecider {
         }
         List<PolicyStore.Policy> policies = store.snapshot().policies();
         List<PolicyStore.Policy> applicable = applicable(policies, agentId, hostType, hostId, now);
-        // 限流单独一套: 它不参与黑白名单匹配, 但同样要按智能体/资源定范围
-        List<PolicyStore.Policy> rates = ratePolicies(policies, agentId, hostType, hostId, now);
+        // 限流单独一套: 它不参与黑白名单匹配, 但同样要按智能体/资源定范围.
+        // 优先级收敛: 只有最高优先级那几条限流器参与超限判定 (recordRate 用同一个函数, 否则会记了不判/判了不记)
+        List<PolicyStore.Policy> rates = topPriority(ratePolicies(policies, agentId, hostType, hostId, now));
         // 无效优先: 规则读不出来的策略不能当"没有这条策略"跳过 —— 丢掉的可能是 deny 项,
         // 后面再有一条白名单命中就变成放行了 (设计文档: 无效规则按拒绝处理)
         for (PolicyStore.Policy p : applicable) {
@@ -199,8 +200,9 @@ public class PolicyDecider {
         String base;
         String why;
 
-        List<PolicyStore.Policy> deny = matchDeny(applicable, parsed);
-        List<PolicyStore.Policy> allow = matchAllow(applicable, parsed);
+        // 黑/白名单各自按优先级收敛后再往下走: 以下的 deny-wins、抬档、policyRevision 原样吃收敛后的集合
+        List<PolicyStore.Policy> deny = topPriority(matchDeny(applicable, parsed));
+        List<PolicyStore.Policy> allow = topPriority(matchAllow(applicable, parsed));
         if (!deny.isEmpty()) {
             gov = deny;
             base = "DENY";
@@ -374,7 +376,9 @@ public class PolicyDecider {
         if (hostId == null) {
             return;
         }
-        for (PolicyStore.Policy p : ratePolicies(store.snapshot().policies(), agentId, hostType, hostId, now)) {
+        // 与 decide() 里的超限判定必须是同一个收敛结果: 只给最高优先级那几条记账,
+        // 被盖掉的限流器不累计 —— 否则它在"升回最高优先级"那一刻就带着一堆偷偷攒下的计数直接超限
+        for (PolicyStore.Policy p : topPriority(ratePolicies(store.snapshot().policies(), agentId, hostType, hostId, now))) {
             limiter.record(p.id(), p.windowSeconds());
         }
     }
@@ -508,6 +512,33 @@ public class PolicyDecider {
         return out;
     }
 
+    /**
+     * 同类型命中集按优先级收敛: 只留 priority 最小 (数值越小越优先) 的那几条, 保持原顺序
+     * <p>
+     * 并列 (priority 相等) 时全部保留, 退回原有的合并规则 —— 白名单取最严、黑名单有一条 NONE 即无条件拒.
+     * 存量策略优先级全是默认 50, 所以收敛前后行为完全一致.
+     * <p>
+     * 只作用于**命中集** (matchDeny / matchAllow / ratePolicies 的结果), 不作用于 applicable() 与
+     * rulesInvalid 的无条件拒绝: 规则读不出来的策略连类型和意图都不可信, 不能让它被一条高优先级的
+     * 同类策略盖掉. 「命中才比较」也保证了高优先级白名单没命中时不会屏蔽掉低优先级白名单
+     */
+    private static List<PolicyStore.Policy> topPriority(List<PolicyStore.Policy> in) {
+        if (in.isEmpty()) {
+            return in;
+        }
+        int min = Integer.MAX_VALUE;
+        for (PolicyStore.Policy p : in) {
+            min = Math.min(min, p.priority());
+        }
+        List<PolicyStore.Policy> out = new ArrayList<>();
+        for (PolicyStore.Policy p : in) {
+            if (p.priority() == min) {
+                out.add(p);
+            }
+        }
+        return out;
+    }
+
     private static boolean anyHit(PolicyStore.Policy policy, Parsed parsed, boolean denySide) {
         for (PolicyStore.Op op : policy.ops()) {
             if (denySide ? hitDeny(op, parsed) : hitAllow(op, parsed)) {
@@ -622,6 +653,9 @@ public class PolicyDecider {
         for (PolicyStore.Policy p : sorted) {
             canonical.append(p.id()).append('|').append(p.type()).append('|')
                     .append(p.approvalMode()).append('|').append(p.rulesInvalid()).append('|')
+                    // 优先级同理: 改了胜出策略的 priority (或 priority 变动换掉了胜出集合) 都要让在途审批凭证失效.
+                    // 被盖掉的那些策略压根不在 matched 里, 改它们的 priority 摘要不变 —— 这是期望语义
+                    .append(p.priority()).append('|')
                     // 时间段字段必须算进摘要: 否则改了时间段、快照重拉、新策略生效, 但审批中的旧凭证
                     // 消费时 policyRevision 仍是旧值, 会被误接受
                     .append(p.actionTimeType()).append('|')

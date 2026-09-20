@@ -57,6 +57,11 @@ public class PolicyStore {
     /** 时间段控制类型值域: 1全天 0每天固定时段 2指定时间范围段 */
     private static final Set<String> ACTION_TIME_TYPES = Set.of("1", "0", "2");
 
+    /** 优先级值域 (数值越小优先级越高) 与缺字段时的默认值; 与控制台的 @Min(1) @Max(100) 同口径 */
+    private static final int PRIORITY_MIN = 1;
+    private static final int PRIORITY_MAX = 100;
+    private static final int PRIORITY_DEFAULT = 50;
+
     // 严格解析: 不用默认的 SMART 模式, 否则非法日期可能被自动归整而"看着解析成功";
     // 必须用 uuuu 而不是 yyyy —— 后者是 year-of-era, STRICT 模式下缺 era 字段会直接抛异常,
     // 导致所有合法的 type=2 时间都被判非法 (已用 JDK 实测确认)
@@ -84,11 +89,14 @@ public class PolicyStore {
      * @param actionTimeStart 起始时间原值 (可能为 null); type=0 为 HH:mm:ss, type=2 为 uuuu-MM-dd HH:mm:ss;
      *                        非法值不在此处兜底, 交给 {@code PolicyDecider.inTimeScope()} 解析失败 → rulesInvalid 拒绝
      * @param actionTimeEnd   结束时间原值, 格式同 actionTimeStart
+     * @param priority        优先级 1~100, 数值越小越优先; 缺失字段折成 {@code 50}, 存在但非法直接 fetch() 失败.
+     *                        同类型多条**命中**时只由优先级最高的那几条决定档位 (见 {@code PolicyDecider.topPriority})
      */
     public record Policy(long id, String name, String type, String hostType, List<Long> hostIds, List<Long> agentIds,
                          String approvalMode, boolean rulesInvalid, String rulesSummary, List<Op> ops,
                          long limit, long windowSeconds,
-                         String actionTimeType, String actionTimeStart, String actionTimeEnd) {
+                         String actionTimeType, String actionTimeStart, String actionTimeEnd,
+                         int priority) {
     }
 
     public record Snapshot(String version, List<Policy> policies) {
@@ -226,6 +234,8 @@ public class PolicyStore {
             if (!actionTimeValid(actionTimeType, p)) {
                 invalid = true;
             }
+            // 优先级: 缺字段折默认 50 (老控制台快照没有这一列), 存在但非法硬失败 —— 见 parsePriority
+            int priority = parsePriority(p);
             // 限流也一样: 缺 limit/windowSeconds 会被读成「不限」, 等于限流静默失效
             if (TYPE_RATE_LIMIT.equals(type) && !invalid
                     && !(p.path("limit").isNumber() && p.path("windowSeconds").isNumber())) {
@@ -277,9 +287,31 @@ public class PolicyStore {
                     p.path("limit").asLong(), p.path("windowSeconds").asLong(),
                     actionTimeType,
                     timeStartNode.isTextual() ? timeStartNode.asText() : null,
-                    timeEndNode.isTextual() ? timeEndNode.asText() : null));
+                    timeEndNode.isTextual() ? timeEndNode.asText() : null,
+                    priority));
         }
         return new Snapshot(versionNode.asText(), List.copyOf(policies));
+    }
+
+    /**
+     * 优先级: 照 actionTimeType 同一套兼容口径 —— 字段缺失 (老控制台快照没有这一列) 折成默认 50,
+     * 存在但非法 (显式 null / 浮点 / 字符串 / 超 int / 越界) 一律整次拉取失败
+     * <p>
+     * 非法值不能静默折成 50: 优先级决定同类型策略谁说了算, 折默认等于把管理员排好的次序悄悄改掉 ——
+     * 一条本该盖住别人的黑名单会突然并列, 或反过来被别人盖掉
+     */
+    private static int parsePriority(JsonNode p) {
+        JsonNode node = p.path("priority");
+        if (node.isMissingNode()) {
+            return PRIORITY_DEFAULT;
+        }
+        // isIntegralNumber()+canConvertToInt() 缺一不可: 前者挡掉 12.9 被 asInt() 截成 12,
+        // 后者挡掉超 int 的整数溢出成另一个档位 (同 isExactLong 的理由)
+        if (!node.isIntegralNumber() || !node.canConvertToInt()
+                || node.intValue() < PRIORITY_MIN || node.intValue() > PRIORITY_MAX) {
+            throw new IllegalStateException("策略快照条目的 priority 不在值域内: " + p);
+        }
+        return node.intValue();
     }
 
     /** JSON 数字是否是无小数、未溢出的整数; isNumber()+asLong() 会把 12.9 截成 12、把超 long 溢出成另一个 id */
