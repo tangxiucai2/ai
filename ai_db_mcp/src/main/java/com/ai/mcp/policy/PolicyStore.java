@@ -13,6 +13,7 @@ import java.time.LocalTime;
 import java.time.format.DateTimeFormatter;
 import java.time.format.ResolverStyle;
 import java.util.ArrayList;
+import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
@@ -36,6 +37,9 @@ public class PolicyStore {
 
     /** 心跳连失阈值, 达到即视为策略源不可用 */
     private static final int FAIL_MAX = 3;
+
+    /** 作用域 id 集合 (hostIds/agentIds) 去重后的条数上限, 与控制台侧同口径 */
+    private static final int IDS_MAX = 200;
 
     public static final String TYPE_WHITELIST = "WHITELIST";
     public static final String TYPE_BLACKLIST = "BLACKLIST";
@@ -70,6 +74,7 @@ public class PolicyStore {
      *
      * @param hostIds      目标资源 id 集合; 单元素 {@code [0]} 是「该 hostType 下全部资源」的哨兵.
      *                     非空, 且 0 不与具体 id 混排 (解析期已保证, 见 {@code fetch})
+     * @param agentIds     适用智能体 id 集合; 单元素 {@code [0]} 是「全部智能体」的哨兵. 约束同 hostIds
      * @param name         策略名称 (管理员填写, 展示用, 不参与裁决/policyRevision)
      * @param rulesInvalid 控制台判定规则无效 (存量/人工导入的坏行); 该策略适用范围内一律拒绝, 不当无策略跳过
      * @param rulesSummary 规则内容摘要 (展示用, 不参与裁决/policyRevision); 规则无效时为 null
@@ -80,7 +85,7 @@ public class PolicyStore {
      *                        非法值不在此处兜底, 交给 {@code PolicyDecider.inTimeScope()} 解析失败 → rulesInvalid 拒绝
      * @param actionTimeEnd   结束时间原值, 格式同 actionTimeStart
      */
-    public record Policy(long id, String name, String type, String hostType, List<Long> hostIds, long agentId,
+    public record Policy(long id, String name, String type, String hostType, List<Long> hostIds, List<Long> agentIds,
                          String approvalMode, boolean rulesInvalid, String rulesSummary, List<Op> ops,
                          long limit, long windowSeconds,
                          String actionTimeType, String actionTimeStart, String actionTimeEnd) {
@@ -174,16 +179,15 @@ public class PolicyStore {
         }
         List<Policy> policies = new ArrayList<>();
         for (JsonNode p : list) {
-            // 作用域字段必须齐全: asLong() 对缺字段/ null / 类型不对都静默给 0, 而 0 是「全部智能体 /
-            // 全部资源」的哨兵 —— 一条本该只管某个智能体的策略会变成管所有智能体, 这是放大授权.
-            // 结构不对就当整次拉取失败 (fail-closed), 不能跳过坏条目: 跳过一条黑名单等于弱化它
-            // isNumber() 不够: 12.9 会被 asLong() 截成 12、超 long 的整数会溢出成另一个真实 id,
-            // 都等于"悄悄换了一条策略的作用域". 必须是无小数、未溢出的整数
-            if (!isExactLong(p.path("id")) || !p.path("type").isTextual() || !p.path("hostType").isTextual()
-                    || !isExactLong(p.path("agentId"))) {
-                throw new IllegalStateException("策略快照条目缺少作用域字段: " + p);
+            // 作用域字段必须齐全: asLong() 对缺字段/ null / 类型不对都静默给 0 —— 结构不对就当整次
+            // 拉取失败 (fail-closed), 不能跳过坏条目: 跳过一条黑名单等于弱化它.
+            // id 用 isNumber() 不够: 12.9 会被 asLong() 截成 12、超 long 的整数会溢出成另一个真实 id,
+            // 都等于"悄悄换了一条策略的身份". 必须是无小数、未溢出的整数 (作用域集合同理, 见 parseIds)
+            if (!isExactLong(p.path("id")) || !p.path("type").isTextual() || !p.path("hostType").isTextual()) {
+                throw new IllegalStateException("策略快照条目缺少基础字段: " + p);
             }
-            List<Long> hostIds = parseHostIds(p);
+            List<Long> hostIds = parseIds(p, "hostIds");
+            List<Long> agentIds = parseIds(p, "agentIds");
             // name 展示用但要求非空: 控制台表结构本就 NOT NULL, 缺失说明快照结构不对, 同一套 fail-closed 口径
             if (!p.path("name").isTextual() || p.path("name").asText().isBlank()) {
                 throw new IllegalStateException("策略快照条目缺少 name: " + p);
@@ -194,7 +198,13 @@ public class PolicyStore {
                 throw new IllegalStateException("策略快照条目的 approvalMode 不在值域内: " + p);
             }
             String type = p.path("type").asText("");
-            boolean invalid = p.path("rulesInvalid").asBoolean(false);
+            // 严格布尔: asBoolean(false) 会把「字段缺失/类型不对」读成"规则有效", 配上 agentIds=[0]
+            // 就是「全部智能体一律放行」—— 与 fail-closed 组合相反, 结构不对一律整次拉取失败
+            JsonNode invalidNode = p.path("rulesInvalid");
+            if (!invalidNode.isBoolean()) {
+                throw new IllegalStateException("策略快照条目的 rulesInvalid 不是布尔: " + p);
+            }
+            boolean invalid = invalidNode.booleanValue();
             // 时间段控制: path() 对不存在的字段返回 MissingNode —— 老控制台的快照条目根本没有这三个属性.
             // 老控制台的真实形态是三字段**全部**缺失; "type 缺失但 start/end 存在"这种混合形态只可能是
             // 控制台侧序列化/映射 bug (新控制台受 @JsonInclude(ALWAYS) 约束三字段要么全出现要么全不出现),
@@ -261,7 +271,7 @@ public class PolicyStore {
             // 不要把非法策略的 actionTimeType 折成 "1" —— 那样 inTimeScope() 会直接放行该策略(全天),
             // 整条 fail-closed 链路失效
             policies.add(new Policy(p.path("id").asLong(), p.path("name").asText(), type, p.path("hostType").asText(""),
-                    hostIds, p.path("agentId").asLong(),
+                    hostIds, agentIds,
                     p.path("approvalMode").asText("NONE"), invalid, rulesSummary,
                     List.copyOf(ops),
                     p.path("limit").asLong(), p.path("windowSeconds").asLong(),
@@ -278,26 +288,31 @@ public class PolicyStore {
     }
 
     /**
-     * 目标资源集合: 必须是非空数组, 每个元素都是 >=0 的精确整数; 0 是「全部资源」哨兵, 只许独占整个数组
+     * 作用域 id 集合 (hostIds 目标资源 / agentIds 适用智能体): 必须是非空数组, 每个元素都是 >=0 的
+     * 精确整数; 0 是「全部」哨兵, 只许独占整个数组; 去重保序后不得超过 {@link #IDS_MAX} (与控制台同口径)
      * <p>
      * 缺失/非数组/空数组都不能折成"全部"或"跳过这条策略" —— 0 是放大授权, 跳过则是弱化黑名单.
      * 一律按整次拉取失败处理 (fail-closed, 沿用旧快照, 连失 3 次退到不可用全拒)
      */
-    private static List<Long> parseHostIds(JsonNode p) {
-        JsonNode node = p.path("hostIds");
+    private static List<Long> parseIds(JsonNode p, String field) {
+        JsonNode node = p.path(field);
         if (!node.isArray() || node.isEmpty()) {
-            throw new IllegalStateException("策略快照条目的 hostIds 非法: " + p);
+            throw new IllegalStateException("策略快照条目的 " + field + " 非法: " + p);
         }
-        List<Long> ids = new ArrayList<>(node.size());
+        // LinkedHashSet 去重保序: 控制台侧已去重, 网关不跨进程信任它 (上限按去重后的规模判)
+        Set<Long> ids = new LinkedHashSet<>();
         for (JsonNode e : node) {
             if (!isExactLong(e) || e.asLong() < 0) {
-                throw new IllegalStateException("策略快照条目的 hostIds 非法: " + p);
+                throw new IllegalStateException("策略快照条目的 " + field + " 非法: " + p);
             }
             ids.add(e.asLong());
         }
         // [0, 12] 这种混排语义不明 (是全部还是只有 12?), 控制台侧不该产出; 按哨兵解读就是放大授权
         if (ids.contains(0L) && ids.size() > 1) {
-            throw new IllegalStateException("策略快照条目的 hostIds 非法: " + p);
+            throw new IllegalStateException("策略快照条目的 " + field + " 非法: " + p);
+        }
+        if (ids.size() > IDS_MAX) {
+            throw new IllegalStateException("策略快照条目的 " + field + " 非法: " + p);
         }
         return List.copyOf(ids);
     }

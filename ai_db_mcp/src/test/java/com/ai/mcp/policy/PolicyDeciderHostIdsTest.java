@@ -41,7 +41,7 @@ class PolicyDeciderHostIdsTest {
         p.put("type", PolicyStore.TYPE_WHITELIST);
         p.put("hostType", "SSH");
         p.put("hostIds", hostIds);
-        p.put("agentId", 0);
+        p.put("agentIds", List.of(0));
         p.put("approvalMode", "NONE");
         p.put("rulesInvalid", false);
         p.put("ops", List.of(Map.of("value", "ls", "matchType", "EXACT")));

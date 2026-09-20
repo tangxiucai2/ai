@@ -56,7 +56,7 @@ class PolicyDeciderActionTimeTest {
         p.put("type", PolicyStore.TYPE_WHITELIST);
         p.put("hostType", "SSH");
         p.put("hostIds", List.of(0));
-        p.put("agentId", 0);
+        p.put("agentIds", List.of(0));
         p.put("approvalMode", "NONE");
         p.put("rulesInvalid", false);
         List<Map<String, Object>> ops = new ArrayList<>();
@@ -162,7 +162,7 @@ class PolicyDeciderActionTimeTest {
         p.put("type", PolicyStore.TYPE_RATE_LIMIT);
         p.put("hostType", "SSH");
         p.put("hostIds", List.of(0));
-        p.put("agentId", 0);
+        p.put("agentIds", List.of(0));
         p.put("approvalMode", "NONE");
         p.put("rulesInvalid", false);
         p.put("ops", List.of());

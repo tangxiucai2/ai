@@ -292,7 +292,7 @@ public class PolicyDecider {
      * 出现"有的策略按 17:59 判、有的按 18:00 判"; 同时让时间判定变成纯函数, 可测
      */
     private static boolean inScope(PolicyStore.Policy p, long agentId, String hostType, long hostId, ZonedDateTime now) {
-        if (p.agentId() != 0 && p.agentId() != agentId) {
+        if (!(p.agentIds().contains(0L) || p.agentIds().contains(agentId))) {
             return false;
         }
         boolean global = p.hostIds().contains(0L) && p.hostType() != null && p.hostType().equals(hostType);
