@@ -18,7 +18,6 @@ import java.util.ArrayList;
 import java.util.Comparator;
 import java.util.List;
 import java.util.regex.Pattern;
-import java.util.regex.PatternSyntaxException;
 
 /**
  * HOST 类访问控制裁决
@@ -485,8 +484,8 @@ public class PolicyDecider {
             case "KEYWORD":
                 return p.raw().contains(value);
             case "REGEX":
-                Pattern pattern = compile(value);
-                return pattern != null && pattern.matcher(p.raw()).find();
+                // 正则已在 PolicyStore.fetch() 里用 re2j 预编译过一次, 这里直接复用 (线性时间, 不怕 ReDoS)
+                return op.pattern() != null && op.pattern().matcher(p.raw()).find();
             default:
                 return false;
         }
@@ -693,14 +692,5 @@ public class PolicyDecider {
     private static String basename(String name) {
         int slash = name.lastIndexOf('/');
         return slash < 0 ? name : name.substring(slash + 1);
-    }
-
-    /** 策略里的正则由控制台按值域校验过; 仍然兜一层, 语法错不外抛 */
-    private static Pattern compile(String regex) {
-        try {
-            return Pattern.compile(regex);
-        } catch (PatternSyntaxException e) {
-            return null;
-        }
     }
 }

@@ -17,8 +17,6 @@ import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
-import java.util.regex.Pattern;
-import java.util.regex.PatternSyntaxException;
 
 /**
  * 访问控制策略本地只读快照
@@ -70,8 +68,12 @@ public class PolicyStore {
     private static final DateTimeFormatter DATE_TIME_FORMATTER =
             DateTimeFormatter.ofPattern("uuuu-MM-dd HH:mm:ss").withResolverStyle(ResolverStyle.STRICT);
 
-    /** 一条操作项: 命令标识 + 匹配方式 (EXACT/KEYWORD/REGEX) */
-    public record Op(String value, String matchType) {
+    /**
+     * 一条操作项: 命令标识 + 匹配方式 (EXACT/KEYWORD/REGEX) + 预编译的正则 (仅 REGEX 非 null, 其余恒 null)
+     * <p>
+     * 正则在 {@link #fetch} 时编译一次, 存进 Op —— PolicyDecider.governs() 不再重复编译
+     */
+    public record Op(String value, String matchType, com.google.re2j.Pattern pattern) {
     }
 
     /**
@@ -263,16 +265,27 @@ public class PolicyStore {
                 }
                 String opValue = valueNode.asText();
                 String matchType = matchTypeNode.asText();
-                // matchType 不在值域内 (或 REGEX 语法编译不过) 是同一类"语义上读不出来": 交给
+                // matchType 不在值域内, 或 value 不在值域内, 是同一类"语义上读不出来": 交给
                 // PolicyDecider 的话, governs() 的 switch 落到 default 就是静默"不匹配" ——
                 // 黑名单少一项 deny, 这项要么在这里直接堵掉, 要么整个策略按拒绝处理 (跟上面同一套口径)
-                if (!OP_MATCH_TYPES.contains(matchType) || (REGEX.equals(matchType) && !isValidRegex(opValue))) {
+                if (!OP_MATCH_TYPES.contains(matchType) || !validOpValue(opValue, matchType)) {
                     if (!invalid) {
-                        throw new IllegalStateException("策略快照条目的操作项无法解析 (matchType 未知或正则语法错误): " + p);
+                        throw new IllegalStateException("策略快照条目的操作项无法解析 (matchType 未知或值域非法): " + p);
                     }
                     continue;
                 }
-                ops.add(new Op(opValue, matchType));
+                // REGEX 只编译一次, 编译结果存进 Op 供 PolicyDecider 直接复用; 编译不过跟值域非法同一套口径
+                com.google.re2j.Pattern pattern = null;
+                if (REGEX.equals(matchType)) {
+                    pattern = compileRegex(opValue);
+                    if (pattern == null) {
+                        if (!invalid) {
+                            throw new IllegalStateException("策略快照条目的操作项无法解析 (正则语法错误): " + p);
+                        }
+                        continue;
+                    }
+                }
+                ops.add(new Op(opValue, matchType, pattern));
             }
             // rulesSummary 展示用可空 (规则无效时控制台本就不下发有意义的摘要), 不必牵连整次拉取失败
             String rulesSummary = p.path("rulesSummary").isTextual() ? p.path("rulesSummary").asText() : null;
@@ -350,18 +363,39 @@ public class PolicyStore {
     }
 
     /**
-     * REGEX 操作项的值是否真的能编译
+     * 操作项的值是否落在值域内: 网关不跨进程信任控制台的校验, 万一存量数据/人工导入/控制台校验口径
+     * 改了, 一条越界的值不该被悄悄放进 ops —— 值域三端 (控制台/网关/前端) 必须一字不差
      * <p>
-     * 控制台侧当前的值域校验 (HOST_CMD 字符集) 三种 matchType 共用同一套, 理论上已经堵住了非法正则语法
-     * —— 但网关不跨进程信任这个约束: 万一存量数据、人工导入、或控制台校验改了口径, 一条编译不过的
-     * 正则不该被 governs() 的 switch 落到 default 静默当"不匹配", 那样一条黑名单会悄悄消失
+     * EXACT 是命令名/路径, 字符集收窄到 {@code [A-Za-z0-9._-]}; KEYWORD/REGEX 放宽到全体可打印 ASCII
+     * (含空格、shell 元字符), 但首尾不许是空格 (裁剪失误的常见形态, 且首尾空格在 KEYWORD 场景没有意义)
      */
-    private static boolean isValidRegex(String regex) {
-        try {
-            Pattern.compile(regex);
-            return true;
-        } catch (PatternSyntaxException e) {
+    static boolean validOpValue(String value, String matchType) {
+        if (value == null) {
             return false;
+        }
+        if ("EXACT".equals(matchType)) {
+            return value.matches("^[A-Za-z0-9._-]{1,64}$");
+        }
+        if ("KEYWORD".equals(matchType) || REGEX.equals(matchType)) {
+            return value.matches("^[\\x20-\\x7E]{1,256}$")
+                    && value.charAt(0) != ' ' && value.charAt(value.length() - 1) != ' ';
+        }
+        return false;
+    }
+
+    /**
+     * REGEX 操作项的值是否真的能用 re2j 编译 (线性时间引擎, 不怕 ReDoS); 成功则返回可复用的 Pattern,
+     * 失败返回 null 交给调用方按"值域非法"同一套口径处置
+     * <p>
+     * 控制台侧当前的值域校验三种 matchType 共用同一套, 理论上已经堵住了非法正则语法 —— 但网关不跨进程
+     * 信任这个约束: 万一存量数据、人工导入、或控制台校验改了口径, 一条编译不过的正则不该被 governs()
+     * 的 switch 落到 default 静默当"不匹配", 那样一条黑名单会悄悄消失
+     */
+    private static com.google.re2j.Pattern compileRegex(String regex) {
+        try {
+            return com.google.re2j.Pattern.compile(regex);
+        } catch (com.google.re2j.PatternSyntaxException e) {
+            return null;
         }
     }
 
