@@ -108,11 +108,15 @@ public class AuditLog {
         // 拒绝统计和真实故障率互相污染. 来源由 SshTool 在 policyDeny() 命中时打上 (POLICY/CONFIRM/APPROVAL/AUTH),
         // 控制台据此把拒绝分类区分开; 这里读完即摘掉, 不让内部字段泄漏给客户端
         String denySource = r == null ? null : (String) r.remove("denySource");
+        // auditError 是拒绝时的审计全文 (带策略名与规则摘要), 对外 error 里已经没有这些 ——
+        // 同样读完即摘掉不外传, 否则等于把规则原文又递回给调用方
+        String auditError = r == null ? null : (String) r.remove("auditError");
         boolean denied = denySource != null;
         boolean ok = r != null && Boolean.TRUE.equals(r.get("success")) && !nonZero;
         String cid = connectionId != null || r == null ? connectionId : (String) r.get("connectionId");
         String error = ok || r == null ? null
                 : nonZero ? "exit=" + exit + (r.get("errorOutput") == null ? "" : " " + r.get("errorOutput"))
+                : denied && auditError != null ? auditError
                 : String.valueOf(r.get("error"));
         Object[] res = resultOf(tool, r);
         record(pick(cred, auditCtx), identity, srcIp, userId, tool, summary, t0, requestId, ok ? SUCCESS : denied ? DENIED : FAILED,

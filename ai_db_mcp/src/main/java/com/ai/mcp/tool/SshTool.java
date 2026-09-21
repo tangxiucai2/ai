@@ -165,9 +165,11 @@ public class SshTool {
     }
 
     /**
-     * 策略拒绝的对外理由, 带上命中策略的标签
+     * 策略拒绝的审计理由, 带上命中策略的标签
      * <p>
-     * 这个串就是审计里的 error: 只写"命中黑名单"看不出是哪条策略拦的, 事后没法对上控制台列表
+     * 这个串**只进审计** (auditError): 只写"命中黑名单"看不出是哪条策略拦的, 事后没法对上控制台列表。
+     * 对外的 error 只回 decision.reason(), 不带策略名与规则摘要 —— 把规则原文回给调用 AI, 等于
+     * 直接告诉它该躲开哪个关键词/正则, 下一条命令就是照着绕过来的
      */
     private static String policyReason(PolicyDecider.Decision decision) {
         String label = decision.policyLabel();
@@ -177,10 +179,12 @@ public class SshTool {
     /**
      * 拒绝原因 + 来源环节 (审计要用来源区分不同拒绝类型)
      *
+     * @param reason         对外理由, 回给调用方; 不含策略名与规则摘要
+     * @param auditReason    审计理由, 带命中策略标签, 只进 auditError 不外传
      * @param approvalNo     仅审批闸门 PENDING/REJECTED 结果有值 (设计文档结论 9), 结构化返回给智能体引导原样重试
      * @param approvalStatus 同上, 取值 PENDING/REJECTED
      */
-    private record Deny(String reason, PolicyDecider.Source source, String approvalNo, String approvalStatus) {
+    private record Deny(String reason, String auditReason, PolicyDecider.Source source, String approvalNo, String approvalStatus) {
     }
 
     /**
@@ -197,10 +201,11 @@ public class SshTool {
      */
     private Deny policyDeny(PolicyDecider.Decision decision, String connectionId, McpTransportContext ctx) {
         if (decision.kind() != PolicyDecider.Kind.ALLOW) {
-            return new Deny(policyReason(decision), decision.source(), decision.approvalNo(), decision.approvalStatus());
+            return new Deny(decision.reason(), policyReason(decision), decision.source(), decision.approvalNo(), decision.approvalStatus());
         }
         if (decision.confirmWaited() && !stillAuthorized(connectionId, ctx)) {
-            return new Deny(notFound(connectionId, ctx), PolicyDecider.Source.AUTH, null, null);
+            String reason = notFound(connectionId, ctx);
+            return new Deny(reason, reason, PolicyDecider.Source.AUTH, null, null);
         }
         // 限流配额不在这里记: 这一步只是"策略放行", openChannel/setCommand/connect 还可能失败
         // (远端拒绝新通道、网络抖动…), 那种情况下命令根本没跑起来。调用方在 channel.connect()
@@ -365,6 +370,8 @@ public class SshTool {
             result.put("error", denied.reason());
             // 供 AuditLog 区分不同拒绝类型, 该字段在审计记录后会被摘掉, 不外传给调用方
             result.put("denySource", denied.source().name());
+            // 带策略标签的审计全文, 同样在审计记录后被摘掉, 不外传给调用方
+            result.put("auditError", denied.auditReason());
             // 结构化字段, 引导智能体原样重试而不是改写命令换着法子试 (设计文档结论 9)
             if (denied.approvalNo() != null) {
                 result.put("approvalNo", denied.approvalNo());
@@ -499,6 +506,8 @@ public class SshTool {
             result.put("error", denied.reason());
             // 供 AuditLog 区分不同拒绝类型, 该字段在审计记录后会被摘掉, 不外传给调用方
             result.put("denySource", denied.source().name());
+            // 带策略标签的审计全文, 同样在审计记录后被摘掉, 不外传给调用方
+            result.put("auditError", denied.auditReason());
             // 结构化字段, 引导智能体原样重试而不是改写命令换着法子试 (设计文档结论 9)
             if (denied.approvalNo() != null) {
                 result.put("approvalNo", denied.approvalNo());

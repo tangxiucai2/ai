@@ -206,7 +206,7 @@ public class PolicyGate {
                 // DENY/CONFIRM/ALLOW 时要保留它自己的 Source, 否则命中新黑名单这类真实策略拒绝会被审计
                 // 误归类成"审批拦截" (设计文档 §7 表格第 373 行, 两种情形要分清)
                 // policyLabel 同理改用 fresh 自己的标签 (对本轮评审的修订): decision.policyLabel() 是旧策略
-                // 的标签, SshTool.policyReason() 会把它原样拼进拒绝文案和审计, 继续用旧标签会把"命中新
+                // 的标签, SshTool.policyReason() 会把它拼进审计原因 (auditError), 继续用旧标签会把"命中新
                 // 黑名单"这类场景误归因到已经过时的旧策略
                 Source denySource = (fresh.kind() == Kind.APPROVAL || fresh.kind() == Kind.BOTH) ? Source.APPROVAL : fresh.source();
                 return new Decision(Kind.DENY, "凭证已消费但策略已变更, 已拒绝执行", fresh.policyLabel(), false, denySource, null, null, null, null);

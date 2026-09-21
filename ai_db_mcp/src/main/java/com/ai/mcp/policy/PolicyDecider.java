@@ -184,9 +184,9 @@ public class PolicyDecider {
         // 限流快速检查放在弹窗之前: 超限直接拒, 不去打扰用户点确认 (确认最长要等控制台下发的确认超时, 至多 300 秒)
         for (PolicyStore.Policy p : rates) {
             if (limiter.exceeded(p.id(), p.limit(), p.windowSeconds())) {
-                return Decision.of(Kind.DENY,
-                        "超出频率限制 (" + p.limit() + " 次 / " + p.windowSeconds() + " 秒), 已拒绝执行",
-                        label(List.of(p)));
+                // 具体配额不进对外文案: 告诉调用方"N 次 / M 秒"等于把限流参数交给它去卡点重试,
+                // 审计要的那份在 label() 里 (rulesSummary 本身就是"N 次 / M 秒")
+                return Decision.of(Kind.DENY, "超出频率限制, 已拒绝执行", label(List.of(p)));
             }
         }
         if (applicable.isEmpty()) {
