@@ -86,6 +86,14 @@
             <scope>test</scope>
         </dependency>
 
+        <!-- 仅测试: TLS 集成测试里现签证书 -->
+        <dependency>
+            <groupId>org.bouncycastle</groupId>
+            <artifactId>bcpkix-jdk15to18</artifactId>
+            <version>1.80</version>
+            <scope>test</scope>
+        </dependency>
+
         <dependency>
             <groupId>com.aidb</groupId>
             <artifactId>aisDriver</artifactId>

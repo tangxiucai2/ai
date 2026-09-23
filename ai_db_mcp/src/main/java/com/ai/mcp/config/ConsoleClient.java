@@ -7,6 +7,7 @@ import com.ai.mcp.audit.AuditLog;
 import com.ai.mcp.tool.IdleReaper;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.http.MediaType;
 import org.springframework.http.client.SimpleClientHttpRequestFactory;
@@ -54,6 +55,7 @@ public class ConsoleClient {
     private static final long SIGN_WINDOW_MS = 5 * 60_000;
     public static final String SRC_CONSOLE = "console";
     public static final String SRC_SPOOL = "spool";
+    public static final String SRC_TLS = "tls";
 
     @Value("${console.url}")
     private String consoleUrl;
@@ -61,6 +63,8 @@ public class ConsoleClient {
     private String nodeId;
     @Value("${console.secret-file:./data/gateway.secret}")
     private Path secretFile;
+    @Autowired(required = false)
+    private TlsManager tls;
 
     private final RestClient http;
     private final ScheduledExecutorService scheduler = Executors.newSingleThreadScheduledExecutor(r -> {
@@ -256,6 +260,9 @@ public class ConsoleClient {
         secret = s;
         unsavedSecret = null;
         unsavedData = null;
+        if (tls != null) {
+            tls.rebase();
+        }
         applyAuth(data);
         enabled = "1".equals(data.get("status"));
         nodeEvent(SRC_CONSOLE, AuditLog.SUCCESS, "注册成功, 密钥已保存");
@@ -264,16 +271,19 @@ public class ConsoleClient {
 
     @SuppressWarnings("unchecked")
     private void report() throws Exception {
-        Map<String, Object> body = Map.of(
-                "cpu", cpuPercent(),
-                "mem", memPercent(),
-                "p99Ms", p99Ms(),
-                "consoleRttMs", consoleRttMs,
-                "inflight", inflight.get(),
-                "todayRequests", todayRequests(),
-                "connections", IdleReaper.totalHandles(),
-                "auditPending", auditPending.getAsLong(),
-                "auditDropped", auditDropped.getAsLong());
+        Map<String, Object> body = new LinkedHashMap<>();
+        body.put("cpu", cpuPercent());
+        body.put("mem", memPercent());
+        body.put("p99Ms", p99Ms());
+        body.put("consoleRttMs", consoleRttMs);
+        body.put("inflight", inflight.get());
+        body.put("todayRequests", todayRequests());
+        body.put("connections", IdleReaper.totalHandles());
+        body.put("auditPending", auditPending.getAsLong());
+        body.put("auditDropped", auditDropped.getAsLong());
+        // connector 实际生效态 authType:authVersion 与最近一次应用失败原因
+        body.put("tlsApplied", tls == null ? null : tls.appliedState());
+        body.put("tlsError", tls == null ? null : tls.lastError());
         long t0 = System.currentTimeMillis();
         Map<String, Object> resp;
         try {
@@ -360,8 +370,25 @@ public class ConsoleClient {
 
     /** package-private: 允许同包单测直接灌数据, 不必绕 HTTP */
     void applyAuth(Map<String, Object> data) {
-        authType = (String) data.get("authType");
-        authToken = (String) data.get("authToken");
+        Object conf = data.get("authConf");
+        if (conf != null) {
+            // 新控制台: 鉴权态只信验签通过的 authConf; 验签失败/版本回退保持当前态, 不降级
+            TlsManager.AuthConf c = tls != null && conf instanceof Map<?, ?> m
+                    ? tls.accept(nodeId, secret, m, data.get("authSign")) : null;
+            if (c != null) {
+                authType = c.authType();
+                authToken = c.authToken();
+                nodeEvent(SRC_TLS, AuditLog.SUCCESS, "认证配置已验签 " + c.authType() + ":" + c.authVersion());
+            } else {
+                String why = tls == null ? "未启用 TLS 管理" : tls.lastError();
+                nodeEvent(SRC_TLS, AuditLog.FAILED, "认证配置未通过校验, 保持当前认证方式: " + why);
+                log.warn("ConsoleClient 认证配置未通过校验, 保持当前认证方式: {}", why);
+            }
+        } else if (tls == null || !tls.signedSeen()) {
+            // 旧控制台 (无 authConf) 沿用顶层字段; 见过签名配置后不再信未签名字段, 防剥离 authConf 降级
+            authType = (String) data.get("authType");
+            authToken = (String) data.get("authToken");
+        }
         maxQps = intOf(data.get("maxQps"));
         IdleReaper.setMaxConnections(intOf(data.get("maxConnections")));
         IdleReaper.setMaxResourceConnections(intOf(data.get("maxResourceConnections")));
@@ -680,13 +707,14 @@ public class ConsoleClient {
     }
 
     /**
-     * BEARER / TLS_TOKEN 校验 Bearer Token; MTLS 要求容器已验证客户端证书(server.ssl.client-auth=need), 纯 HTTP 下 fail-closed; 缺失/未知类型一律拒绝
+     * BEARER / TLS_TOKEN 校验 Bearer Token, TLS_TOKEN 另要求 HTTPS 连接; MTLS 要求容器已验证客户端证书, 纯 HTTP 下 fail-closed;
+     * 缺失/未知类型一律拒绝. 以控制台下发的 authType 为准, 与 connector 是否切换成功无关
      */
-    public boolean checkToken(String authorization, boolean clientCertVerified) {
+    public boolean checkToken(String authorization, boolean clientCertVerified, boolean secure) {
         if ("MTLS".equals(authType)) {
             return clientCertVerified;
         }
-        if (!"BEARER".equals(authType) && !"TLS_TOKEN".equals(authType)) {
+        if (!"BEARER".equals(authType) && !("TLS_TOKEN".equals(authType) && secure)) {
             return false;
         }
         String token = authToken;

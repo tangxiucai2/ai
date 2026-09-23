@@ -105,7 +105,7 @@ public class McpRequestFilter implements Filter {
         }
         Object certs = req.getAttribute("jakarta.servlet.request.X509Certificate");
         boolean clientCertVerified = certs instanceof Object[] arr && arr.length > 0;
-        if (!console.checkToken(req.getHeader("Authorization"), clientCertVerified)) {
+        if (!console.checkToken(req.getHeader("Authorization"), clientCertVerified, req.isSecure())) {
             resp.setHeader("WWW-Authenticate", "Bearer");
             deny(resp, HttpServletResponse.SC_UNAUTHORIZED, "Token 校验失败", agentCode, userName, srcIp, userId);
             return;
