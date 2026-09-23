@@ -3,6 +3,7 @@ package com.ai.mcp.tool;
 import com.ai.mcp.audit.AuditLog;
 import com.ai.mcp.config.ConsoleClient;
 import com.ai.mcp.config.McpRequestFilter;
+import com.ai.mcp.policy.PolicyDecider;
 import io.modelcontextprotocol.common.McpTransportContext;
 import org.springaicommunity.mcp.annotation.McpTool;
 import org.springaicommunity.mcp.annotation.McpToolParam;
@@ -60,6 +61,8 @@ public class CredentialTool {
         } catch (ConsoleClient.Rejected e) {
             result.put("success", false);
             result.put("error", e.getMessage());
+            // 控制台明确拒绝记为授权拒绝 (审计 DENIED/AUTH), 不可达走下面的故障分支
+            result.put("denySource", PolicyDecider.Source.AUTH.name());
         } catch (Exception e) {
             result.put("success", false);
             result.put("error", "控制台不可达, 无法获取凭据列表");

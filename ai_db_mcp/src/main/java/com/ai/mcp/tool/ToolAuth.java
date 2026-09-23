@@ -38,40 +38,56 @@ public class ToolAuth {
     }
 
     /**
+     * 本次重校验结果与原因
+     *
+     * @param reason 本次拒绝/故障的原因 (控制台拒绝原文或 {@link #CONSOLE_UNAVAILABLE}); 放行或无从得知时为 null
+     */
+    record Check(Verdict verdict, String reason) {
+    }
+
+    /**
      * 操作已有连接前的实时授权重校验
-     * <p>
-     * 固定资源模式不重校验: 身份本就不可信, 加了既改变存量行为又白付性能
      */
     static Verdict verdict(McpTransportContext ctx, Conn.ConnMeta meta) {
+        return check(ctx, meta).verdict();
+    }
+
+    /**
+     * 同 {@link #verdict}, 另带本次原因
+     * <p>
+     * 单连接操作的报错必须取本次原因: 请求级 DENY_REASON 是首写语义, 同一请求里先被拒再遇故障时会串成前一次的原因.
+     * 固定资源模式不重校验: 身份本就不可信, 加了既改变存量行为又白付性能
+     */
+    static Check check(McpTransportContext ctx, Conn.ConnMeta meta) {
         if (!Conn.MODE_USER.equals(meta.authMode())) {
-            return Verdict.ALLOW;
+            return new Check(Verdict.ALLOW, null);
         }
         ConsoleClient.ResolvedUser identity = McpRequestFilter.userIdentity(ctx);
         String userToken = McpRequestFilter.userToken(ctx);
         if (identity == null || userToken == null || console == null) {
-            return Verdict.DENY;
+            return new Check(Verdict.DENY, null);
         }
         try {
             McpRequestFilter.setResolved(ctx,
                     console.resolveCredential(identity.agentCode(), userToken, meta.credentialId(), identity.userName(),
                             McpRequestFilter.peerIp(ctx)));
-            return Verdict.ALLOW;
+            return new Check(Verdict.ALLOW, null);
         } catch (ConsoleClient.Rejected e) {
             // 拒绝路径也要留痕: 否则撤权后的越权尝试在审计里只是笼统的「连接不存在」, 看不出对哪台机器、为什么被拒
             log.info("已有连接授权已失效 credentialId={}: {}", meta.credentialId(), e.getMessage());
             denied(ctx, meta, e.getMessage());
-            return Verdict.DENY;
+            return new Check(Verdict.DENY, e.getMessage());
         } catch (Exception e) {
             // 控制台不可达: 拒绝而非放行, 否则撤权在故障窗口内失效
             log.warn("重校验控制台不可达 credentialId={}: {}", meta.credentialId(), e.toString());
             denied(ctx, meta, CONSOLE_UNAVAILABLE);
-            return Verdict.UNAVAILABLE;
+            return new Check(Verdict.UNAVAILABLE, CONSOLE_UNAVAILABLE);
         }
     }
 
-    /** 单连接操作只关心放不放行 */
-    static boolean recheck(McpTransportContext ctx, Conn.ConnMeta meta) {
-        return verdict(ctx, meta) == Verdict.ALLOW;
+    /** 连接取不到时的报错: 有本次重校验原因报原因, 否则 (本地不存在/归属不符/已失效) 报连接不存在 */
+    static String notFound(String connectionId, Check check) {
+        return check != null && check.reason() != null ? check.reason() : "Connection not found: " + connectionId;
     }
 
     static final String CONSOLE_UNAVAILABLE = "控制台不可达, 无法校验凭据授权";

@@ -2,7 +2,6 @@ package com.ai.mcp.tool;
 
 import com.ai.mcp.audit.AuditLog;
 import com.ai.mcp.config.ConsoleClient;
-import com.ai.mcp.config.McpRequestFilter;
 import com.ai.mcp.policy.PolicyDecider;
 import com.ai.mcp.policy.PolicyGate;
 import com.jcraft.jsch.*;
@@ -54,6 +53,8 @@ public class SshTool {
         } catch (ConsoleClient.Rejected e) {
             result.put("success", false);
             result.put("error", e.getMessage());
+            // 控制台明确拒绝记为授权拒绝 (审计 DENIED/AUTH), 不可达走下面的故障分支
+            result.put("denySource", PolicyDecider.Source.AUTH.name());
             return result;
         } catch (Exception e) {
             result.put("success", false);
@@ -156,15 +157,6 @@ public class SshTool {
     }
 
     /**
-     * 连接取不到时的报错: 若是授权重校验拒绝, 报真实原因而非笼统的「连接不存在」,
-     * 否则撤权后的越权尝试在审计里看不出是谁、对哪台机器、为什么被拒
-     */
-    private static String notFound(String connectionId, McpTransportContext ctx) {
-        String reason = McpRequestFilter.denyReason(ctx);
-        return reason != null ? reason : "Connection not found: " + connectionId;
-    }
-
-    /**
      * 策略拒绝的审计理由, 带上命中策略的标签
      * <p>
      * 这个串**只进审计** (auditError): 只写"命中黑名单"看不出是哪条策略拦的, 事后没法对上控制台列表。
@@ -197,15 +189,19 @@ public class SshTool {
      * 没等确认的路径不重复校验 —— lookup 刚刚校验过, 再来一次是白付一次控制台往返
      * <p>
      * 来源以判定自带的为准, 只有"确认等完发现授权已被撤"这一支不是判定产出的 —— 那是复检拦下的,
-     * 归 AUTH, 不能算成「人工拒绝」(人点了同意, 是授权没了)
+     * 归 AUTH, 不能算成「人工拒绝」(人点了同意, 是授权没了). 复检时控制台不可达或句柄已失效是故障
+     * 不是拒绝: 来源为 null, 调用方按失败记审计
      */
     private Deny policyDeny(PolicyDecider.Decision decision, String connectionId, McpTransportContext ctx) {
         if (decision.kind() != PolicyDecider.Kind.ALLOW) {
             return new Deny(decision.reason(), policyReason(decision), decision.source(), decision.approvalNo(), decision.approvalStatus());
         }
-        if (decision.confirmWaited() && !stillAuthorized(connectionId, ctx)) {
-            String reason = notFound(connectionId, ctx);
-            return new Deny(reason, reason, PolicyDecider.Source.AUTH, null, null);
+        if (decision.confirmWaited()) {
+            ToolAuth.Check c = stillAuthorized(connectionId, ctx);
+            if (c == null || c.verdict() != ToolAuth.Verdict.ALLOW) {
+                String reason = ToolAuth.notFound(connectionId, c);
+                return new Deny(reason, reason, c != null && c.verdict() == ToolAuth.Verdict.DENY ? PolicyDecider.Source.AUTH : null, null, null);
+            }
         }
         // 限流配额不在这里记: 这一步只是"策略放行", openChannel/setCommand/connect 还可能失败
         // (远端拒绝新通道、网络抖动…), 那种情况下命令根本没跑起来。调用方在 channel.connect()
@@ -217,20 +213,24 @@ public class SshTool {
     /**
      * 授权是否仍然有效 (确认等待后的复检)
      * <p>
-     * 用户自选模式回控制台按连接元数据里的 credentialId 重校验, 控制台不可达同样判为否;
+     * 用户自选模式回控制台按连接元数据里的 credentialId 重校验;
      * 固定资源模式不重校验 (见 {@link ToolAuth#verdict}), 这里相当于只确认句柄与归属还在
+     *
+     * @return 重校验结果; 句柄已不存在或归属不符返回 null (未回控制台)
      */
-    private boolean stillAuthorized(String connectionId, McpTransportContext ctx) {
+    private ToolAuth.Check stillAuthorized(String connectionId, McpTransportContext ctx) {
         Conn<Session> conn = reaper.peek(connectionId);
-        return conn != null && conn.meta().accessibleBy(ctx) && ToolAuth.recheck(ctx, conn.meta());
+        return conn == null || !conn.meta().accessibleBy(ctx) ? null : ToolAuth.check(ctx, conn.meta());
     }
 
     /**
      * 归属校验: 先比本地四元组 (模式/智能体/用户), 用户模式再回控制台按连接元数据里的 credentialId 重校验授权
      * <p>
      * 只比前缀是不够的: 老模式持同一 credentialId 的虚拟凭据会摸到用户模式建的连接
+     * <p>
+     * 本次重校验被控制台明确拒绝时在 result 标记授权拒绝 (审计 DENIED/AUTH); 不可达/本地不存在不标, 按失败记
      */
-    private Session lookup(String connectionId, McpTransportContext ctx) {
+    private Session lookup(String connectionId, McpTransportContext ctx, Map<String, Object> result) {
         if (connectionId == null) {
             return null;
         }
@@ -239,7 +239,13 @@ public class SshTool {
         if (conn == null || !conn.meta().accessibleBy(ctx)) {
             return null;
         }
-        if (!ToolAuth.recheck(ctx, conn.meta())) {
+        ToolAuth.Check c = ToolAuth.check(ctx, conn.meta());
+        if (c.verdict() != ToolAuth.Verdict.ALLOW) {
+            if (c.verdict() == ToolAuth.Verdict.DENY) {
+                result.put("denySource", PolicyDecider.Source.AUTH.name());
+            }
+            // 报本次原因, 不取请求级 DENY_REASON (首写, 会串成同一请求里前一次的原因)
+            result.put("error", ToolAuth.notFound(connectionId, c));
             return null;
         }
         Conn<Session> live = reaper.acquire(connectionId);
@@ -262,7 +268,7 @@ public class SshTool {
         Map<String, Object> result = new HashMap<>();
         
         // 以原子 remove 的返回值决定谁负责关闭: 与 sweep/异常清理并发时不会重复关
-        Conn<Session> removed = lookup(connectionId, ctx) == null ? null : sessions.remove(connectionId);
+        Conn<Session> removed = lookup(connectionId, ctx, result) == null ? null : sessions.remove(connectionId);
         Session session = removed == null ? null : removed.handle();
         ChannelExec channel = session == null ? null : activeChannels.remove(connectionId);
         if (channel != null && channel.isConnected()) {
@@ -278,7 +284,7 @@ public class SshTool {
             result.put("message", "SSH connection closed successfully");
         } else {
             result.put("success", false);
-            result.put("error", notFound(connectionId, ctx));
+            result.putIfAbsent("error", ToolAuth.notFound(connectionId, null));
         }
         
         return result;
@@ -347,10 +353,10 @@ public class SshTool {
 
         Map<String, Object> result = new HashMap<>();
 
-        Session session = lookup(connectionId, ctx);
+        Session session = lookup(connectionId, ctx, result);
         if (session == null) {
             result.put("success", false);
-            result.put("error", notFound(connectionId, ctx));
+            result.putIfAbsent("error", ToolAuth.notFound(connectionId, null));
             return result;
         }
 
@@ -368,10 +374,13 @@ public class SshTool {
         if (denied != null) {
             result.put("success", false);
             result.put("error", denied.reason());
-            // 供 AuditLog 区分不同拒绝类型, 该字段在审计记录后会被摘掉, 不外传给调用方
-            result.put("denySource", denied.source().name());
-            // 带策略标签的审计全文, 同样在审计记录后被摘掉, 不外传给调用方
-            result.put("auditError", denied.auditReason());
+            // 来源为 null 是复检故障 (不可达/句柄失效), 不标拒绝, 审计按失败记
+            if (denied.source() != null) {
+                // 供 AuditLog 区分不同拒绝类型, 该字段在审计记录后会被摘掉, 不外传给调用方
+                result.put("denySource", denied.source().name());
+                // 带策略标签的审计全文, 同样在审计记录后被摘掉, 不外传给调用方
+                result.put("auditError", denied.auditReason());
+            }
             // 结构化字段, 引导智能体原样重试而不是改写命令换着法子试 (设计文档结论 9)
             if (denied.approvalNo() != null) {
                 result.put("approvalNo", denied.approvalNo());
@@ -485,10 +494,10 @@ public class SshTool {
 
         Map<String, Object> result = new HashMap<>();
 
-        Session session = lookup(connectionId, ctx);
+        Session session = lookup(connectionId, ctx, result);
         if (session == null) {
             result.put("success", false);
-            result.put("error", notFound(connectionId, ctx));
+            result.putIfAbsent("error", ToolAuth.notFound(connectionId, null));
             return result;
         }
 
@@ -504,10 +513,13 @@ public class SshTool {
         if (denied != null) {
             result.put("success", false);
             result.put("error", denied.reason());
-            // 供 AuditLog 区分不同拒绝类型, 该字段在审计记录后会被摘掉, 不外传给调用方
-            result.put("denySource", denied.source().name());
-            // 带策略标签的审计全文, 同样在审计记录后被摘掉, 不外传给调用方
-            result.put("auditError", denied.auditReason());
+            // 来源为 null 是复检故障 (不可达/句柄失效), 不标拒绝, 审计按失败记
+            if (denied.source() != null) {
+                // 供 AuditLog 区分不同拒绝类型, 该字段在审计记录后会被摘掉, 不外传给调用方
+                result.put("denySource", denied.source().name());
+                // 带策略标签的审计全文, 同样在审计记录后被摘掉, 不外传给调用方
+                result.put("auditError", denied.auditReason());
+            }
             // 结构化字段, 引导智能体原样重试而不是改写命令换着法子试 (设计文档结论 9)
             if (denied.approvalNo() != null) {
                 result.put("approvalNo", denied.approvalNo());

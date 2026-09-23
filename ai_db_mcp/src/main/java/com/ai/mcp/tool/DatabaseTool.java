@@ -19,7 +19,7 @@ import org.springframework.stereotype.Component;
 
 import com.ai.mcp.audit.AuditLog;
 import com.ai.mcp.config.ConsoleClient;
-import com.ai.mcp.config.McpRequestFilter;
+import com.ai.mcp.policy.PolicyDecider;
 
 @Component
 public class DatabaseTool {
@@ -55,6 +55,8 @@ public class DatabaseTool {
         } catch (ConsoleClient.Rejected e) {
             result.put("success", false);
             result.put("error", e.getMessage());
+            // 控制台明确拒绝记为授权拒绝 (审计 DENIED/AUTH), 不可达走下面的故障分支
+            result.put("denySource", PolicyDecider.Source.AUTH.name());
             return result;
         } catch (Exception e) {
             result.put("success", false);
@@ -126,18 +128,11 @@ public class DatabaseTool {
     }
 
     /**
-     * 连接取不到时的报错: 若是授权重校验拒绝, 报真实原因而非笼统的「连接不存在」,
-     * 否则撤权后的越权尝试在审计里看不出是谁、对哪台机器、为什么被拒
-     */
-    private static String notFound(String connectionId, McpTransportContext ctx) {
-        String reason = McpRequestFilter.denyReason(ctx);
-        return reason != null ? reason : "Connection not found: " + connectionId;
-    }
-
-    /**
      * 归属校验: 先比本地四元组 (模式/智能体/用户), 用户模式再回控制台按连接元数据里的 credentialId 重校验授权
+     * <p>
+     * 本次重校验被控制台明确拒绝时在 result 标记授权拒绝 (审计 DENIED/AUTH); 不可达/本地不存在不标, 按失败记
      */
-    private Connection lookup(String connectionId, McpTransportContext ctx) {
+    private Connection lookup(String connectionId, McpTransportContext ctx, Map<String, Object> result) {
         if (connectionId == null) {
             return null;
         }
@@ -146,7 +141,13 @@ public class DatabaseTool {
         if (conn == null || !conn.meta().accessibleBy(ctx)) {
             return null;
         }
-        if (!ToolAuth.recheck(ctx, conn.meta())) {
+        ToolAuth.Check c = ToolAuth.check(ctx, conn.meta());
+        if (c.verdict() != ToolAuth.Verdict.ALLOW) {
+            if (c.verdict() == ToolAuth.Verdict.DENY) {
+                result.put("denySource", PolicyDecider.Source.AUTH.name());
+            }
+            // 报本次原因, 不取请求级 DENY_REASON (首写, 会串成同一请求里前一次的原因)
+            result.put("error", ToolAuth.notFound(connectionId, c));
             return null;
         }
         Conn<Connection> live = reaper.acquire(connectionId);
@@ -168,7 +169,7 @@ public class DatabaseTool {
         Map<String, Object> result = new HashMap<>();
         
         // 以原子 remove 的返回值决定谁负责关闭: 与 sweep/异常清理并发时不会重复关
-        Conn<Connection> removed = lookup(connectionId, ctx) == null ? null : connections.remove(connectionId);
+        Conn<Connection> removed = lookup(connectionId, ctx, result) == null ? null : connections.remove(connectionId);
         Connection conn = removed == null ? null : removed.handle();
         if (conn != null) {
             try {
@@ -181,7 +182,7 @@ public class DatabaseTool {
             }
         } else {
             result.put("success", false);
-            result.put("error", notFound(connectionId, ctx));
+            result.putIfAbsent("error", ToolAuth.notFound(connectionId, null));
         }
         
         return result;
@@ -243,10 +244,10 @@ public class DatabaseTool {
         private Map<String, Object> db_execute0(String connectionId, String sql, McpTransportContext ctx) {
         Map<String, Object> result = new HashMap<>();
         
-        Connection conn = lookup(connectionId, ctx);
+        Connection conn = lookup(connectionId, ctx, result);
         if (conn == null) {
             result.put("success", false);
-            result.put("error", notFound(connectionId, ctx));
+            result.putIfAbsent("error", ToolAuth.notFound(connectionId, null));
             return result;
         }
 
@@ -278,10 +279,10 @@ public class DatabaseTool {
         private Map<String, Object> db_execute_transaction0(String connectionId, List<String> sqlList, McpTransportContext ctx) {
         Map<String, Object> result = new HashMap<>();
         
-        Connection conn = lookup(connectionId, ctx);
+        Connection conn = lookup(connectionId, ctx, result);
         if (conn == null) {
             result.put("success", false);
-            result.put("error", notFound(connectionId, ctx));
+            result.putIfAbsent("error", ToolAuth.notFound(connectionId, null));
             return result;
         }
 
