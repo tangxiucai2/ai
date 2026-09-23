@@ -4,6 +4,7 @@ import com.fasterxml.jackson.databind.ObjectMapper;
 import io.modelcontextprotocol.common.McpTransportContext;
 import io.modelcontextprotocol.json.jackson.JacksonMcpJsonMapper;
 import io.modelcontextprotocol.server.transport.WebMvcStreamableServerTransportProvider;
+import jakarta.servlet.http.HttpServletRequest;
 import org.springframework.ai.mcp.server.common.autoconfigure.properties.McpServerStreamableHttpProperties;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
@@ -27,18 +28,23 @@ public class McpTransportConfig {
                 .mcpEndpoint(props.getMcpEndpoint())
                 .keepAliveInterval(props.getKeepAliveInterval())
                 .disallowDelete(props.isDisallowDelete())
-                .contextExtractor(req -> {
-                    Map<String, Object> ctx = new HashMap<>();
-                    for (String k : new String[]{McpRequestFilter.CREDENTIAL, McpRequestFilter.USER_IDENTITY,
-                            McpRequestFilter.USER_TOKEN, McpRequestFilter.IN_FLIGHT, McpRequestFilter.RESOLVED, McpRequestFilter.DENY_REASON,
-                            McpRequestFilter.SRC_IP, McpRequestFilter.USER_ID, McpRequestFilter.REQUEST_ID}) {
-                        Object v = req.servletRequest().getAttribute(k);
-                        if (v != null) {
-                            ctx.put(k, v);
-                        }
-                    }
-                    return ctx.isEmpty() ? McpTransportContext.EMPTY : McpTransportContext.create(ctx);
-                })
+                .contextExtractor(req -> extract(req.servletRequest()))
                 .build();
+    }
+
+    /**
+     * Filter 写入的 request attribute → McpTransportContext (工具层只能从这里拿到身份与对端地址)
+     */
+    public static McpTransportContext extract(HttpServletRequest req) {
+        Map<String, Object> ctx = new HashMap<>();
+        for (String k : new String[]{McpRequestFilter.CREDENTIAL, McpRequestFilter.USER_IDENTITY,
+                McpRequestFilter.USER_TOKEN, McpRequestFilter.IN_FLIGHT, McpRequestFilter.RESOLVED, McpRequestFilter.DENY_REASON,
+                McpRequestFilter.SRC_IP, McpRequestFilter.PEER_IP, McpRequestFilter.USER_ID, McpRequestFilter.REQUEST_ID}) {
+            Object v = req.getAttribute(k);
+            if (v != null) {
+                ctx.put(k, v);
+            }
+        }
+        return ctx.isEmpty() ? McpTransportContext.EMPTY : McpTransportContext.create(ctx);
     }
 }

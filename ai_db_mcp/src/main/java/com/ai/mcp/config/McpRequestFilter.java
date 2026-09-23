@@ -45,6 +45,9 @@ public class McpRequestFilter implements Filter {
     public static final String SRC_IP = "soag.src-ip";
     public static final String USER_ID = "soag.user-id";
 
+    /** TCP 对端地址, 仅用于智能体 IP 范围校验; 不认 XFF, 直连节点上 XFF 可伪造 */
+    public static final String PEER_IP = "soag.peer-ip";
+
     /**
      * 本次调用的审计事件裸 id (AuditLog.run() 入口生成, PolicyGate.approval() 读出拼成完整 CK 格式塞进
      * /gate 请求体, 第二部分设计文档结论 22)。与 RESOLVED/DENY_REASON 不同——**两种鉴权模式都要预置**,
@@ -95,6 +98,7 @@ public class McpRequestFilter implements Filter {
         String userName = param(req, "X-User-Name", "userName");
         String userId = param(req, "X-User-Id", "userId");
         String srcIp = srcIp(req);
+        String peerIp = req.getRemoteAddr();
         if (!console.isEnabled()) {
             deny(resp, HttpServletResponse.SC_SERVICE_UNAVAILABLE, "节点未启用", agentCode, userName, srcIp, userId);
             return;
@@ -146,9 +150,9 @@ public class McpRequestFilter implements Filter {
         ConsoleClient.ResolvedUser identity = null;
         try {
             if (token != null) {
-                credential = console.resolve(agentCode, token, userName);
+                credential = console.resolve(agentCode, token, userName, peerIp);
             } else {
-                identity = console.resolveUser(agentCode, userToken);
+                identity = console.resolveUser(agentCode, userToken, peerIp);
             }
         } catch (ConsoleClient.Rejected e) {
             deny(resp, HttpServletResponse.SC_FORBIDDEN, e.getMessage(), agentCode, userName, srcIp, userId);
@@ -173,6 +177,7 @@ public class McpRequestFilter implements Filter {
         // 两种鉴权模式都要预置 (与上面 else 分支里那几个用户自选模式专属的 attribute 不同), 见 REQUEST_ID 字段注释
         req.setAttribute(REQUEST_ID, new java.util.concurrent.atomic.AtomicReference<String>());
         req.setAttribute(SRC_IP, srcIp);
+        req.setAttribute(PEER_IP, peerIp);
         req.setAttribute(USER_ID, userId);
         long t0 = System.currentTimeMillis();
         console.requestBegin();
@@ -239,6 +244,11 @@ public class McpRequestFilter implements Filter {
     /** 工具方法从 McpTransportContext 取可信用户身份 (用户自选模式才有) */
     public static ConsoleClient.ResolvedUser userIdentity(McpTransportContext ctx) {
         return ctx == null ? null : (ConsoleClient.ResolvedUser) ctx.get(USER_IDENTITY);
+    }
+
+    /** 工具方法从 McpTransportContext 取 TCP 对端地址 (透传控制台做智能体 IP 范围校验) */
+    public static String peerIp(McpTransportContext ctx) {
+        return ctx == null ? null : (String) ctx.get(PEER_IP);
     }
 
     /** 工具方法从 McpTransportContext 取原始用户 Token (换取凭据用) */

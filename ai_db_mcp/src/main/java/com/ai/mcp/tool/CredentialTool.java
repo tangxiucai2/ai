@@ -49,7 +49,7 @@ public class CredentialTool {
         }
         try {
             Map<String, Object> data = console.listCredentials(identity.agentCode(),
-                    McpRequestFilter.userToken(ctx), keyword);
+                    McpRequestFilter.userToken(ctx), keyword, McpRequestFilter.peerIp(ctx));
             result.put("success", true);
             result.put("credentials", data.get("items"));
             result.put("total", data.get("total"));

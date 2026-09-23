@@ -53,7 +53,8 @@ public class ToolAuth {
         }
         try {
             McpRequestFilter.setResolved(ctx,
-                    console.resolveCredential(identity.agentCode(), userToken, meta.credentialId(), identity.userName()));
+                    console.resolveCredential(identity.agentCode(), userToken, meta.credentialId(), identity.userName(),
+                            McpRequestFilter.peerIp(ctx)));
             return Verdict.ALLOW;
         } catch (ConsoleClient.Rejected e) {
             // 拒绝路径也要留痕: 否则撤权后的越权尝试在审计里只是笼统的「连接不存在」, 看不出对哪台机器、为什么被拒
@@ -109,7 +110,7 @@ public class ToolAuth {
         ConsoleClient.Resolved cred;
         try {
             cred = console.resolveCredential(identity.agentCode(),
-                    McpRequestFilter.userToken(ctx), credentialId, identity.userName());
+                    McpRequestFilter.userToken(ctx), credentialId, identity.userName(), McpRequestFilter.peerIp(ctx));
         } catch (ConsoleClient.Rejected e) {
             // 被拒也要留下"想连哪台": 否则审计只有用户与原因, 追不到访问目标.
             // 标成 attempt: 这是尝试访问的目标, 不是已授权资源, 别让审计看起来像连成功过

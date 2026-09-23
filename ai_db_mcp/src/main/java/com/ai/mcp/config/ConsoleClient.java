@@ -101,7 +101,7 @@ public class ConsoleClient {
     private volatile boolean policyReported;
     private volatile String lastPolicyVersion;
 
-    // 身份解析缓存 key = agentCode\ntoken\nuserName; 访问序 LinkedHashMap, 超 1000 条淘汰最久未用; 拒绝不缓存
+    // 身份解析缓存 key = agentCode\ntoken\nuserName\npeerIp; 访问序 LinkedHashMap, 超 1000 条淘汰最久未用; 拒绝不缓存
     private static final int RESOLVE_CACHE_MAX = 1000;
     private final LinkedHashMap<String, CachedResolved> resolveCache = new LinkedHashMap<>(64, 0.75f, true) {
         @Override
@@ -425,14 +425,21 @@ public class ConsoleClient {
         return resp != null && Integer.valueOf(200).equals(resp.get("code")) && resp.get("data") != null;
     }
 
-    @SuppressWarnings("unchecked")
     private Map<String, Object> signedPost(String path, Object body) throws Exception {
         String ts = String.valueOf(System.currentTimeMillis());
+        return send(path, ts, hmac(secret, nodeId + "\n" + ts), body);
+    }
+
+    /**
+     * 纯传输: 只发 HTTP, 签名已由 signedPost 算好; 包级可见仅供测试覆写截获请求, 生产只经 signedPost 调用
+     */
+    @SuppressWarnings("unchecked")
+    Map<String, Object> send(String path, String ts, String sign, Object body) {
         return http.post().uri(consoleUrl + path)
                 .contentType(MediaType.APPLICATION_JSON)
                 .header("X-Worker-Id", nodeId)
                 .header("X-Timestamp", ts)
-                .header("X-Sign", hmac(secret, nodeId + "\n" + ts))
+                .header("X-Sign", sign)
                 .body(body)
                 .retrieve().body(Map.class);
     }
@@ -496,8 +503,9 @@ public class ConsoleClient {
      * @throws Exception 控制台不可达
      */
     @SuppressWarnings("unchecked")
-    public Resolved resolve(String agentCode, String token, String userName) throws Exception {
-        String key = agentCode + "\n" + token + "\n" + (userName == null ? "" : userName);
+    public Resolved resolve(String agentCode, String token, String userName, String peerIp) throws Exception {
+        // 带上对端地址: IP 范围校验结果随来源地址变化, 不能让 A 地址的放行结果被 B 地址命中
+        String key = agentCode + "\n" + token + "\n" + (userName == null ? "" : userName) + "\n" + peerIp;
         long now = System.currentTimeMillis();
         synchronized (resolveCache) {
             CachedResolved hit = resolveCache.get(key);
@@ -510,6 +518,9 @@ public class ConsoleClient {
         body.put("token", token);
         if (userName != null) {
             body.put("userName", userName);
+        }
+        if (peerIp != null) {
+            body.put("srcIp", peerIp);
         }
         Map<String, Object> resp = signedPost("/agent/gateway/opt/resolve", body);
         if (!isOk(resp)) {
@@ -551,10 +562,13 @@ public class ConsoleClient {
      * @throws Exception 控制台不可达
      */
     @SuppressWarnings("unchecked")
-    public ResolvedUser resolveUser(String agentCode, String userToken) throws Exception {
+    public ResolvedUser resolveUser(String agentCode, String userToken, String peerIp) throws Exception {
         Map<String, Object> body = new java.util.HashMap<>();
         body.put("agentCode", agentCode);
         body.put("userToken", userToken);
+        if (peerIp != null) {
+            body.put("srcIp", peerIp);
+        }
         Map<String, Object> d = (Map<String, Object>) checkedData(signedPost("/agent/gateway/opt/resolve-user", body));
         return new ResolvedUser(
                 ((Number) d.get("agentId")).longValue(),
@@ -567,10 +581,13 @@ public class ConsoleClient {
      * 列出该用户可用凭据 (不含密码与虚拟凭据), 不缓存
      */
     @SuppressWarnings("unchecked")
-    public Map<String, Object> listCredentials(String agentCode, String userToken, String keyword) throws Exception {
+    public Map<String, Object> listCredentials(String agentCode, String userToken, String keyword, String peerIp) throws Exception {
         Map<String, Object> body = new java.util.HashMap<>();
         body.put("agentCode", agentCode);
         body.put("userToken", userToken);
+        if (peerIp != null) {
+            body.put("srcIp", peerIp);
+        }
         if (keyword != null && !keyword.isBlank()) {
             body.put("keyword", keyword);
         }
@@ -583,11 +600,15 @@ public class ConsoleClient {
      * 建连与后续每次操作已有连接都调它: 撤权/过期/禁用即刻生效
      */
     @SuppressWarnings("unchecked")
-    public Resolved resolveCredential(String agentCode, String userToken, long credentialId, String userName) throws Exception {
+    public Resolved resolveCredential(String agentCode, String userToken, long credentialId, String userName,
+                                      String peerIp) throws Exception {
         Map<String, Object> body = new java.util.HashMap<>();
         body.put("agentCode", agentCode);
         body.put("userToken", userToken);
         body.put("credentialId", credentialId);
+        if (peerIp != null) {
+            body.put("srcIp", peerIp);
+        }
         Map<String, Object> d = (Map<String, Object>) checkedData(signedPost("/agent/gateway/opt/resolve-credential", body));
         return new Resolved(
                 ((Number) d.get("agentId")).longValue(),
