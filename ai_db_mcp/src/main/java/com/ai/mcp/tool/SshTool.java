@@ -138,11 +138,14 @@ public class SshTool {
                 result.put("error", "SSH connection failed: Connection timed out");
             } else {
                 result.put("success", false);
-                result.put("error", "SSH connection failed: " + errorMessage);
+                // JSch 原始消息可能带异常类名/内部细节, 只进审计
+                result.put("error", "SSH connection failed");
+                result.put("auditError", "SSH connection failed: " + e);
             }
         } catch (Exception e) {
             result.put("success", false);
-            result.put("error", "Failed to establish SSH connection: " + e.getMessage());
+            result.put("error", "Failed to establish SSH connection");
+            result.put("auditError", "Failed to establish SSH connection: " + e);
         } finally {
             if (!result.containsKey("success") || !(Boolean) result.get("success")) {
                 if (session != null) {
@@ -470,7 +473,8 @@ public class SshTool {
         } catch (Exception e) {
             result.put("success", false);
             result.put("connectionId", connectionId);
-            result.put("error", "Failed to execute command: " + e.getMessage());
+            result.put("error", "Failed to execute command");
+            result.put("auditError", "Failed to execute command: " + e);
         } finally {
             if (channel != null && channel.isConnected()) {
                 channel.disconnect();
@@ -614,7 +618,8 @@ public class SshTool {
         } catch (Exception e) {
             result.put("success", false);
             result.put("connectionId", connectionId);
-            result.put("error", "Failed to execute command: " + e.getMessage());
+            result.put("error", "Failed to execute command");
+            result.put("auditError", "Failed to execute command: " + e);
         } finally {
             if (channel != null && channel.isConnected()) {
                 channel.disconnect();

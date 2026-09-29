@@ -1,5 +1,13 @@
 server:
   port: 9090
+  # /error 兜底 (SSE 出错等走容器错误页) 不回堆栈/异常消息, 显式写死防配置漂移
+  error:
+    include-stacktrace: never
+    include-message: never
+    include-binding-errors: never
+    include-exception: false
+    whitelabel:
+      enabled: false
 
 spring:
   application:
