@@ -16,7 +16,7 @@ spring:
         # 放宽太多会把那些请求的故障发现时间也无谓拉长
         request-timeout: 330s
         name: AI MCP Server
-        instructions: "提供数据库连接管理和远程主机SSH连接功能。支持创建和管理数据库连接、执行SQL语句、事务处理，以及SSH连接到远程主机执行命令。"
+        instructions: "提供数据库连接管理和远程主机SSH连接功能。支持创建和管理数据库连接、执行单条SQL语句（不支持事务，查询最多返回1000行），以及SSH连接到远程主机执行命令。"
         annotation-scanner:
           enabled: true
           base-packages:
@@ -29,6 +29,10 @@ console:
   url: http://127.0.0.1:5200/soag/api
   node-id: gw-change-me
   secret-file: ./data/gateway.secret
+
+# DBC 执行服务 (数据库工具经它执行 SQL; 含 context-path, 请求签名的 path 按它计算); 未配置时数据库工具不可用
+dbc:
+  base-url: http://127.0.0.1:5500/dbc/api
 
 logging:
   level:

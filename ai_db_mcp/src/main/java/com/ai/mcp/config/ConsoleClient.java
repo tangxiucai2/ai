@@ -34,6 +34,7 @@ import java.util.Objects;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentLinkedDeque;
+import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeUnit;
@@ -119,10 +120,53 @@ public class ConsoleClient {
      *
      * @param dbType 资源主类型 (primaryType 推导), 同时就是访问控制策略的 hostType 口径
      * @param hostId 目标资源 id, 策略按它定范围; 旧版控制台不下发时为 null → 不按策略放行
+     * @param dbc    DBC 票据 (仅 DATABASE 类; 控制台不再下发数据库密码), 其余类别或旧版控制台为 null
      */
     public record Resolved(long agentId, long credentialId, String category, String dbType, String address,
                            Integer port, String dbName, String username, String password,
-                           String agentCode, String userName, Long hostId) {
+                           String agentCode, String userName, Long hostId, DbcTicket dbc) {
+
+        /** 不带 DBC 票据 (HOST 类 / 拒绝留痕等只补身份与资源的场景) */
+        public Resolved(long agentId, long credentialId, String category, String dbType, String address,
+                        Integer port, String dbName, String username, String password,
+                        String agentCode, String userName, Long hostId) {
+            this(agentId, credentialId, category, dbType, address, port, dbName, username, password,
+                    agentCode, userName, hostId, null);
+        }
+    }
+
+    /**
+     * DBC 票据与请求签名会话密钥: 票据本身即敏感信息, 只在内存, 不落盘不打日志不进审计
+     *
+     * @param expireAt   票据到期时间 (epoch 毫秒)
+     * @param sessionKey base64url 编码的 32 字节会话密钥
+     */
+    public record DbcTicket(String ticket, long expireAt, String sessionKey) {
+
+        /** 距到期不足该值即视为需要续签: 留出一次 SQL 往返与 DBC 时钟偏差的余量 */
+        public static final long RENEW_BEFORE_MS = 60_000;
+
+        public boolean expiring(long now) {
+            return expireAt - now < RENEW_BEFORE_MS;
+        }
+
+        /** 默认 toString 会把票据与密钥带进任何打印 Resolved 的日志 */
+        @Override
+        public String toString() {
+            return "DbcTicket[expireAt=" + expireAt + "]";
+        }
+    }
+
+    /** 固定资源模式续签被控制台明确拒绝 (撤权/过期/禁用): 数据库工具据此主动关闭该凭据的连接 */
+    public interface CredentialRevoked {
+        void onRevoked(long agentId, long credentialId);
+    }
+
+    /** 允许多个监听者: 单槽位时后注册的会静默顶掉先注册的, 被顶掉的一方撤权后不再关连接 */
+    private final List<CredentialRevoked> credentialRevoked = new CopyOnWriteArrayList<>();
+
+    public void credentialRevoked(CredentialRevoked listener) {
+        credentialRevoked.add(Objects.requireNonNull(listener));
     }
 
     private record CachedResolved(Resolved value, long expireAt) {
@@ -536,7 +580,8 @@ public class ConsoleClient {
         long now = System.currentTimeMillis();
         synchronized (resolveCache) {
             CachedResolved hit = resolveCache.get(key);
-            if (hit != null && hit.expireAt() > now) {
+            // 数据库票据快到期时绕过缓存续签: 缓存 ttl 由控制台下发, 可能长过票据剩余寿命
+            if (hit != null && hit.expireAt() > now && (hit.value().dbc() == null || !hit.value().dbc().expiring(now))) {
                 return hit.value();
             }
         }
@@ -554,6 +599,16 @@ public class ConsoleClient {
             // 仅 400/401/403 是控制台明确拒绝 (回 403); 500/空响应属控制台故障, 抛出走 503
             int code = resp != null && resp.get("code") instanceof Number ? ((Number) resp.get("code")).intValue() : -1;
             if (code == 400 || code == 401 || code == 403) {
+                // 之前放行过的凭据这次被拒 = 撤权/过期/禁用: 丢掉旧缓存并通知数据库工具关掉已有连接
+                CachedResolved stale;
+                synchronized (resolveCache) {
+                    stale = resolveCache.remove(key);
+                }
+                if (stale != null) {
+                    for (CredentialRevoked listener : credentialRevoked) {
+                        listener.onRevoked(stale.value().agentId(), stale.value().credentialId());
+                    }
+                }
                 Object msg = resp.get("msg");
                 throw new Rejected(msg == null ? "控制台拒绝" : msg.toString());
             }
@@ -572,12 +627,20 @@ public class ConsoleClient {
                 (String) d.get("password"),
                 agentCode,
                 userName,
-                d.get("hostId") == null ? null : ((Number) d.get("hostId")).longValue());
+                d.get("hostId") == null ? null : ((Number) d.get("hostId")).longValue(),
+                dbcOf(d));
         long ttl = d.get("ttlSeconds") == null ? 60 : ((Number) d.get("ttlSeconds")).longValue();
         synchronized (resolveCache) {
             resolveCache.put(key, new CachedResolved(r, now + ttl * 1000));
         }
         return r;
+    }
+
+    /** 票据三项缺任一视为没有票据 (旧版控制台), 由数据库工具报版本不匹配 */
+    private static DbcTicket dbcOf(Map<String, Object> d) {
+        return d.get("dbcTicket") instanceof String t && d.get("dbcTicketExpireAt") instanceof Number exp
+                && d.get("dbcSessionKey") instanceof String key
+                ? new DbcTicket(t, exp.longValue(), key) : null;
     }
 
     /**
@@ -649,7 +712,8 @@ public class ConsoleClient {
                 (String) d.get("password"),
                 agentCode,
                 userName,
-                d.get("hostId") == null ? null : ((Number) d.get("hostId")).longValue());
+                d.get("hostId") == null ? null : ((Number) d.get("hostId")).longValue(),
+                dbcOf(d));
     }
 
     /**

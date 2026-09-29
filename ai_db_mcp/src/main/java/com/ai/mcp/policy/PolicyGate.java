@@ -12,13 +12,19 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.stereotype.Component;
 
+import java.nio.charset.StandardCharsets;
+import java.security.MessageDigest;
+import java.security.NoSuchAlgorithmException;
+import java.util.HexFormat;
 import java.util.LinkedHashMap;
+import java.util.List;
 import java.util.Map;
 import java.util.concurrent.ArrayBlockingQueue;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Future;
 import java.util.concurrent.ThreadPoolExecutor;
 import java.util.concurrent.TimeUnit;
+import java.util.function.Function;
 
 /**
  * 策略闸门: 工具执行前的最后一道判定 + 二次确认
@@ -51,6 +57,9 @@ public class PolicyGate {
             },
             new ThreadPoolExecutor.AbortPolicy());
 
+    /** 凭据分类 (控制台 resolve 下发的 category) */
+    private static final String CATEGORY_DATABASE = "DATABASE";
+
     private final PolicyDecider decider;
     private final ConsoleClient console;
 
@@ -60,39 +69,82 @@ public class PolicyGate {
     }
 
     /**
+     * 一次待裁决的操作: HOST 是一条命令, DATABASE 是一条 SQL (op/tables 已由 DBC 解析好)
+     * <p>
+     * 闸门里要裁决不止一次 (首判 / 确认后 fresh decide / 审批放行前 fresh decide), 三次必须是<b>同一组输入</b>,
+     * 否则 policyRevision 相等的判定没有意义 —— 所以把"怎么裁决"连同输入一起封进 decide, 闸门只管调用
+     *
+     * @param operation 原文 (命令 / SQL): 进确认弹窗正文与 /gate 请求体的 operation
+     * @param noun      给人看的称呼 ("命令" / "SQL"), 只影响文案
+     * @param target    执行目标的称呼 ("主机" / "数据库"), 只影响确认弹窗文案
+     * @param logKey    日志里原文的键名 ("command" / "sql")
+     * @param logValue  日志里打印的值: HOST 是命令原文; DATABASE 只打摘要 (SQL 可能夹带业务数据, 不落 INFO 日志)
+     */
+    private record Subject(String operation, String noun, String target, String logKey, String logValue,
+                           Function<ConsoleClient.Resolved, Decision> decide) {
+    }
+
+    /**
      * 判定一条 HOST 命令; 需要确认时在此阻塞等待用户点选
      *
      * @param tool 调用方工具名 (ssh_execute / ssh_execute_long_running), 第二部分随 /gate 请求体传给控制台展示
      * @return 判定结果, {@link Kind#ALLOW} 之外一律按拒绝处理
      */
     public Decision check(McpTransportContext ctx, McpSyncServerExchange exchange, String command, String tool) {
+        return check(ctx, exchange, tool, new Subject(command, "命令", "主机", "command", command,
+                c -> decider.decide(c.agentId(), c.dbType(), c.hostId(), command)));
+    }
+
+    /**
+     * 判定一条 DATABASE 类 SQL (op / tables / defaultNamespace 来自 DBC 解析); 确认、审批、fresh decide
+     * 与 HOST 完全同一套流程, /gate 请求体的 operation 填 SQL 原文
+     *
+     * @param tool 调用方工具名 (db_execute)
+     */
+    public Decision checkDatabase(McpTransportContext ctx, McpSyncServerExchange exchange, String sql, String op,
+                                  List<String> tables, String defaultNamespace, String tool) {
+        return check(ctx, exchange, tool, new Subject(sql, "SQL", "数据库", "sql", sqlLogDigest(sql), c -> {
+            // 凭据不是数据库类 (如 SSH 凭据) 时 dbType 是 SSH, 按 DATABASE 策略裁决就是空集 → 放行,
+            // 等于拿主机凭据绕开全部数据库策略; 这里直接拒
+            if (!CATEGORY_DATABASE.equals(c.category())) {
+                return Decision.of(Kind.DENY, "该凭据不是数据库类资源, 不能执行 SQL", null);
+            }
+            // 与 HOST 的 decide() 同口径: 拿不到目标资源就不许按策略放行
+            if (c.hostId() == null) {
+                return Decision.of(Kind.DENY, "无法确定目标资源, 不能按策略放行", null);
+            }
+            return decider.decideDatabase(c.agentId(), c.dbType(), c.hostId(), op, tables, defaultNamespace);
+        }));
+    }
+
+    private Decision check(McpTransportContext ctx, McpSyncServerExchange exchange, String tool, Subject subject) {
         ConsoleClient.Resolved cred = credential(ctx);
         if (cred == null) {
-            return Decision.auth(Kind.DENY, "无法确定调用身份, 不能放行命令");
+            return Decision.auth(Kind.DENY, "无法确定调用身份, 不能放行" + subject.noun());
         }
-        Decision decision = decider.decide(cred.agentId(), cred.dbType(), cred.hostId(), command);
+        Decision decision = subject.decide().apply(cred);
         if (decision.kind() == Kind.APPROVAL) {
-            return approval(ctx, decision, tool, command, cred);
+            return approval(ctx, decision, tool, subject, cred);
         }
         if (decision.kind() == Kind.BOTH) {
-            return confirmThenApproval(ctx, exchange, decision, tool, command, cred);
+            return confirmThenApproval(ctx, exchange, decision, tool, subject, cred);
         }
         if (decision.kind() != Kind.CONFIRM) {
             return decision;
         }
-        Decision verdict = confirm(exchange, command, decision);
+        Decision verdict = confirm(exchange, subject, decision);
         if (verdict.kind() == Kind.ALLOW) {
             // 用户已同意, 但等待期间(最长按控制台下发的确认超时)策略可能已经变严 —— 只信旧判定就可能放行一条
             // 已被新策略拒绝(甚至改成要管理员审批)的命令。用当前快照重新裁决一次:
             // 只在新结果比"确认放行"更严 (DENY/APPROVAL) 时才收回旧许可; 新结果仍是 ALLOW/CONFIRM
             // 说明许可没被削弱, 不用为同一件事再弹一次窗 (那样会形成确认死循环)
-            Decision fresh = decider.decide(cred.agentId(), cred.dbType(), cred.hostId(), command);
+            Decision fresh = subject.decide().apply(cred);
             // （对现网问题的修订）fresh 升级为 APPROVAL 时必须走 /gate 建单, 不能像 DENY 那样直接
             // 把这条未处理的裁决原样当拒绝返回——那样永远不会调用 approvalGate(), 审批单压根建不出来,
             // 审计里还会显示成"策略拒绝"而不是"审批拦截" (二次确认期间策略被改成需要审批时的真实现网案例)
             // fresh 升级为 BOTH 时同样要走: 用户已经做完确认, 不需要再走 confirmThenApproval() 重弹一次
             if (fresh.kind() == Kind.APPROVAL || fresh.kind() == Kind.BOTH) {
-                return approval(ctx, fresh, tool, command, cred);
+                return approval(ctx, fresh, tool, subject, cred);
             }
             if (fresh.kind() != Kind.ALLOW && fresh.kind() != Kind.CONFIRM) {
                 verdict = fresh;
@@ -108,17 +160,17 @@ public class PolicyGate {
      * 先本人确认再管理员审批, 任一环节拒绝即终止 (设计文档 2026-09-18 §2.3)
      */
     private Decision confirmThenApproval(McpTransportContext ctx, McpSyncServerExchange exchange,
-                                          Decision decision, String tool, String command, ConsoleClient.Resolved cred) {
-        Decision verdict = confirm(exchange, command, decision);
+                                          Decision decision, String tool, Subject subject, ConsoleClient.Resolved cred) {
+        Decision verdict = confirm(exchange, subject, decision);
         if (verdict.kind() != Kind.ALLOW) {
             // 确认失败/拒绝/超时/不支持: 终止, 不进入审批
             return verdict.waited();
         }
         // 与既有 CONFIRM 分支同款: 确认等待期间策略可能已变, 用当前快照重新裁决一次
-        Decision fresh = decider.decide(cred.agentId(), cred.dbType(), cred.hostId(), command);
+        Decision fresh = subject.decide().apply(cred);
         if (fresh.kind() == Kind.APPROVAL || fresh.kind() == Kind.BOTH) {
             // 仍需要审批 (原样是 BOTH, 或被放宽成纯 APPROVAL 都要走): 用 fresh 走 /gate
-            return approval(ctx, fresh, tool, command, cred).waited();
+            return approval(ctx, fresh, tool, subject, cred).waited();
         }
         if (fresh.kind() != Kind.ALLOW && fresh.kind() != Kind.CONFIRM) {
             // 策略在等待期间被收紧到 DENY: 收回许可
@@ -136,7 +188,7 @@ public class PolicyGate {
      * 也被 {@link #confirmThenApproval} 复用 (BOTH 模式确认通过后): 传入的 decision 可能来自 fresh 重新裁决,
      * kind() 可能是 APPROVAL 或 BOTH, 本方法内部不读 kind(), 只读 policyLabel/policyRevision/policyType 三个字段
      */
-    private Decision approval(McpTransportContext ctx, Decision decision, String tool, String command, ConsoleClient.Resolved cred) {
+    private Decision approval(McpTransportContext ctx, Decision decision, String tool, Subject subject, ConsoleClient.Resolved cred) {
         ConsoleClient.ResolvedUser identity = McpRequestFilter.userIdentity(ctx);
         Long userId = identity != null ? identity.userId() : null;
         String bareRequestId = McpRequestFilter.requestId(ctx);
@@ -159,7 +211,7 @@ public class PolicyGate {
         body.put("policyRevision", decision.policyRevision());
         body.put("policyType", decision.policyType());
         body.put("tool", tool);
-        body.put("operation", command);
+        body.put("operation", subject.operation());
         body.put("requestId", fullRequestId);
         body.put("clientRequestId", java.util.UUID.randomUUID().toString());
 
@@ -195,7 +247,7 @@ public class PolicyGate {
                 // policyRevision 又绕开。其余一切结果一律拒绝执行, 即便凭证已被消费也不回退 (结论 21, §12 残留风险 4)
                 // BOTH 也要纳入 (设计文档 2026-09-18 §0.5): confirmThenApproval() 通过 BOTH 走到这里时,
                 // fresh 重新裁决出的仍是 BOTH 不是 APPROVAL —— 漏判会导致 BOTH 模式走完全部流程仍被拒绝
-                Decision fresh = decider.decide(cred.agentId(), cred.dbType(), cred.hostId(), command);
+                Decision fresh = subject.decide().apply(cred);
                 if ((fresh.kind() == Kind.APPROVAL || fresh.kind() == Kind.BOTH)
                         && decision.policyRevision().equals(fresh.policyRevision())) {
                     // .waited(): 复用既有 confirmWaited()/stillAuthorized() 机制堵撤权窗口 (结论 21 第二项) ——
@@ -213,14 +265,15 @@ public class PolicyGate {
             }
             case "PENDING":
                 return Decision.approval(Kind.DENY,
-                        "该命令需管理员审批, 已提交审批单 " + result.approvalNo()
-                                + "。请勿修改命令内容——修改后需重新审批。审批通过后原样重试本命令即可执行。",
+                        "该" + subject.noun() + "需管理员审批, 已提交审批单 " + result.approvalNo()
+                                + "。请勿修改" + subject.noun() + "内容——修改后需重新审批。审批通过后原样重试本"
+                                + subject.noun() + "即可执行。",
                         decision.policyLabel(), result.approvalNo(), "PENDING");
             case "REJECTED":
                 // 处理人一并拼进文案 (设计文档 §10 验收清单第 5 条: "直接回拒绝意见 + 处理人"),
                 // comment/approvedBy 已在上面的必填校验里保证非空, 不用再判空
                 return Decision.approval(Kind.DENY,
-                        "该命令已被拒绝执行 (单号 " + result.approvalNo() + ", 处理人: " + result.approvedBy()
+                        "该" + subject.noun() + "已被拒绝执行 (单号 " + result.approvalNo() + ", 处理人: " + result.approvedBy()
                                 + ", 理由: " + result.comment() + ")",
                         decision.policyLabel(), result.approvalNo(), "REJECTED");
             case "BUSY":
@@ -244,6 +297,25 @@ public class PolicyGate {
         }
     }
 
+    /** DATABASE 类放行执行时记账, 调用时机同 {@link #recordRate} (SQL 真的要发给 DBC 执行时) */
+    public void recordDatabaseRate(McpTransportContext ctx) {
+        ConsoleClient.Resolved cred = credential(ctx);
+        if (cred != null) {
+            decider.recordDatabaseRate(cred.agentId(), cred.dbType(), cred.hostId());
+        }
+    }
+
+    /** SQL 的日志摘要: sha256 前 12 位 hex + 长度, 能对上审计记录又不暴露原文 */
+    static String sqlLogDigest(String sql) {
+        String s = sql == null ? "" : sql;
+        try {
+            byte[] d = MessageDigest.getInstance("SHA-256").digest(s.getBytes(StandardCharsets.UTF_8));
+            return "sha256:" + HexFormat.of().formatHex(d).substring(0, 12) + ",len=" + s.length();
+        } catch (NoSuchAlgorithmException e) {
+            throw new IllegalStateException(e);
+        }
+    }
+
     private static boolean isBlank(String s) {
         return s == null || s.isBlank();
     }
@@ -254,14 +326,14 @@ public class PolicyGate {
         return resolved != null ? resolved : McpRequestFilter.credential(ctx);
     }
 
-    private Decision confirm(McpSyncServerExchange exchange, String command, Decision decision) {
+    private Decision confirm(McpSyncServerExchange exchange, Subject subject, Decision decision) {
         if (exchange == null || !supportsElicitation(exchange)) {
             return Decision.confirm(Kind.DENY, "该客户端不支持人工二次确认, 已拒绝执行", decision.policyLabel());
         }
         McpSchema.ElicitResult result;
         Future<McpSchema.ElicitResult> future;
         try {
-            future = CONFIRM_POOL.submit(() -> exchange.createElicitation(request(command, decision.policyLabel())));
+            future = CONFIRM_POOL.submit(() -> exchange.createElicitation(request(subject, decision.policyLabel())));
         } catch (Exception e) {
             return Decision.confirm(Kind.DENY, "二次确认通道繁忙, 已拒绝执行", decision.policyLabel());
         }
@@ -271,7 +343,7 @@ public class PolicyGate {
         } catch (java.util.concurrent.TimeoutException e) {
             // 超时: 撤掉等待, 但底层请求可能仍挂在客户端 — 由会话关闭或客户端作答回收
             future.cancel(true);
-            log.info("二次确认超时 policy={} command={}", decision.policyLabel(), command);
+            log.info("二次确认超时 policy={} {}={}", decision.policyLabel(), subject.logKey(), subject.logValue());
             return Decision.confirm(Kind.DENY, "二次确认超时 (" + timeout + " 秒), 已拒绝执行", decision.policyLabel());
         } catch (InterruptedException e) {
             Thread.currentThread().interrupt();
@@ -317,7 +389,7 @@ public class PolicyGate {
     }
 
     /** 弹窗正文: 完整命令原文 —— 参数不做自动规则, 交给本人看着点 */
-    private static McpSchema.ElicitRequest request(String command, String policyLabel) {
+    private static McpSchema.ElicitRequest request(Subject subject, String policyLabel) {
         Map<String, Object> properties = new LinkedHashMap<>();
         Map<String, Object> approve = new LinkedHashMap<>();
         approve.put("type", "boolean");
@@ -331,7 +403,8 @@ public class PolicyGate {
         schema.put("required", java.util.List.of(FIELD));
 
         return McpSchema.ElicitRequest.builder()
-                .message("智能体请求在目标主机执行以下命令, 请确认是否允许:\n\n" + command
+                .message("智能体请求在目标" + subject.target() + "执行以下"
+                        + subject.noun() + ", 请确认是否允许:\n\n" + subject.operation()
                         + "\n\n命中策略: " + policyLabel + "\n未确认或拒绝都会阻止执行。")
                 .requestedSchema(schema)
                 .build();

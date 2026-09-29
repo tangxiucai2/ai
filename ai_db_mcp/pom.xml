@@ -93,14 +93,6 @@
             <version>1.80</version>
             <scope>test</scope>
         </dependency>
-
-        <dependency>
-            <groupId>com.aidb</groupId>
-            <artifactId>aisDriver</artifactId>
-            <version>1.0-SNAPSHOT</version>
-            <scope>system</scope>
-            <systemPath>${project.basedir}/lib/aisDriver-1.0-SNAPSHOT.jar</systemPath>
-        </dependency>
     </dependencies>
 
     <build>

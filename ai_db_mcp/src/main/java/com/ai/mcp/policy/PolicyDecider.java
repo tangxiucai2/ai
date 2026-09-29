@@ -17,10 +17,15 @@ import java.time.temporal.ChronoUnit;
 import java.util.ArrayList;
 import java.util.Comparator;
 import java.util.List;
+import java.util.Locale;
 import java.util.regex.Pattern;
 
 /**
- * HOST 类访问控制裁决
+ * HOST / DATABASE 类访问控制裁决
+ * <p>
+ * 两类共用同一套骨架 (规则无效 → 限流 → 无策略放行 → 黑白名单 → 优先级收敛 → 档位合并/审批抬档),
+ * 只有匹配谓词不同; DATABASE 类另多一道 DATA_SCOPE 数据范围 (见 {@link #decideDatabase}).
+ * 两类策略按 hostType 分开 ({@link PolicyStore.Policy#database()}), 互不参与对方的裁决与限流记账.
  * <p>
  * 结果是三值 + 一个"谁来确认": ALLOW / DENY / CONFIRM(本人确认) / APPROVAL(管理员审批).
  * <p>
@@ -169,11 +174,127 @@ public class PolicyDecider {
         if (hostId == null) {
             return Decision.of(Kind.DENY, "无法确定目标资源, 不能按策略放行", null);
         }
-        List<PolicyStore.Policy> policies = store.snapshot().policies();
+        // 只看 HOST 类: 快照里同时有 DATABASE 类 (改造前快照只有 HOST 类), 不过滤的话一条绑到同 id 资源的
+        // DATA_SCOPE/数据库限流会把 SSH 命令拖进严格模式或占掉配额
+        List<PolicyStore.Policy> policies = policies(false);
         List<PolicyStore.Policy> applicable = applicable(policies, agentId, hostType, hostId, now);
         // 限流单独一套: 它不参与黑白名单匹配, 但同样要按智能体/资源定范围.
         // 优先级收敛: 只有最高优先级那几条限流器参与超限判定 (recordRate 用同一个函数, 否则会记了不判/判了不记)
         List<PolicyStore.Policy> rates = topPriority(ratePolicies(policies, agentId, hostType, hostId, now));
+        Decision pre = precheck(applicable, rates);
+        if (pre != null) {
+            return pre;
+        }
+        if (applicable.isEmpty()) {
+            // 该智能体没有黑白名单 (压根没策略, 或只有限流策略) → 维持接入前的现状放行.
+            // 只有限流的智能体绝不能落到"未命中任何白名单": 那等于配了限流就把所有命令封死
+            return Decision.of(Kind.ALLOW, null, null);
+        }
+        Parsed parsed = parse(command);
+        String base;
+        String why;
+
+        // 黑/白名单各自按优先级收敛后再往下走: 以下的 deny-wins、抬档、policyRevision 原样吃收敛后的集合
+        List<PolicyStore.Policy> deny = topPriority(matchDeny(applicable, parsed));
+        List<PolicyStore.Policy> allow = topPriority(matchAllow(applicable, parsed));
+        if (!deny.isEmpty()) {
+            base = "DENY";
+            why = "命中黑名单";
+        } else {
+            if (allow.isEmpty()) {
+                // 严格模式: 该智能体有策略但这条命令未被明确允许
+                return Decision.of(Kind.DENY, "未命中任何白名单, 该智能体已配置访问控制策略", label(applicable));
+            }
+            boolean clean = !parsed.compound() && !parsed.explicitPath();
+            base = clean ? "ALLOW" : "DENY";
+            why = clean ? "命中白名单" : parsed.compound() ? "复合命令不允许白名单自动放行" : "显式路径命令不允许白名单自动放行";
+        }
+        return settle(deny, allow, base, why);
+    }
+
+    /**
+     * DATABASE 类裁决 (设计文档 2026-09-29 §3.5 真值表 / §3.6 表名规则)
+     * <p>
+     * 输入全部来自 DBC 的解析结果, 网关不自己解析 SQL: 单条语句只有一个顶层 op (复合语句只看顶层类型,
+     * 嵌套读取交给 DATA_SCOPE 管); tables 是已规范化的物理表 {@code 命名空间.表} (CTE/别名不算).
+     * <p>
+     * 与 HOST 的差异只有两处:
+     * <ul>
+     *   <li>黑白名单谓词: op 与策略操作项 EXACT 相等 (大小写不敏感), 没有复合命令/显式路径那套降级</li>
+     *   <li>多一道 DATA_SCOPE: 与黑白名单是<b>与</b>的关系, 只能更严 —— 不通过直接 DENY, 不给确认/审批机会。
+     *       通过后, 实际命中表的 DATA_SCOPE (逐表先命中再按优先级收敛, 见 {@link #scopeHits}) 在档位上<b>当白名单侧</b>参与合并: 只配数据范围时由它们
+     *       决定档位 (基调放行, CONFIRM/APPROVAL/BOTH 照常生效); 与白名单一起取最严; 黑名单拒判基调下同白名单,
+     *       只能抬到 APPROVAL/BOTH, 救不回 NONE 的无条件拒绝。它们也进 matched, 标签与 policyRevision 都带上。
+     *       只配了 DATA_SCOPE、没有黑白名单时不落进"未命中任何白名单"的严格模式 (否则单配数据范围等于全封)</li>
+     * </ul>
+     *
+     * @param dbType           资源主类型 (MYSQL/POSTGRESQL/ORACLE/DAMENG…), 既是策略 hostType 口径, 也决定表名大小写规则
+     * @param op               DBC 解析出的顶层操作 (十项之一)
+     * @param tables           DBC 解析出的物理表 {@code 命名空间.表}; 可为空
+     * @param defaultNamespace 连接的实际默认命名空间 (DBC 建连时读出), 策略里的裸表名补它
+     */
+    public Decision decideDatabase(long agentId, String dbType, long hostId, String op, List<String> tables,
+                                   String defaultNamespace) {
+        return decideDatabase(agentId, dbType, hostId, op, tables, defaultNamespace, ZonedDateTime.now(BUSINESS_ZONE));
+    }
+
+    /** 包级重载: 测试可传入固定时刻 */
+    Decision decideDatabase(long agentId, String dbType, long hostId, String op, List<String> tables,
+                            String defaultNamespace, ZonedDateTime now) {
+        if (store.unavailable()) {
+            return Decision.of(Kind.DENY, "访问控制策略源不可用, 已暂停 SQL 执行", null);
+        }
+        List<PolicyStore.Policy> policies = policies(true);
+        List<PolicyStore.Policy> applicable = applicable(policies, agentId, dbType, hostId, now);
+        List<PolicyStore.Policy> rates = topPriority(ratePolicies(policies, agentId, dbType, hostId, now));
+        Decision pre = precheck(applicable, rates);
+        if (pre != null) {
+            return pre;
+        }
+        if (applicable.isEmpty()) {
+            // 与 HOST 同: 没有黑白名单/数据范围 (含只有限流) → 维持接入前的现状放行
+            return Decision.of(Kind.ALLOW, null, null);
+        }
+        List<PolicyStore.Policy> scopes = new ArrayList<>();
+        List<PolicyStore.Policy> lists = new ArrayList<>();
+        for (PolicyStore.Policy p : applicable) {
+            (PolicyStore.TYPE_DATA_SCOPE.equals(p.type()) ? scopes : lists).add(p);
+        }
+        // passed: 实际放行了这次访问的 DATA_SCOPE (先命中、再按优先级收敛), 并入白名单侧参与档位合并
+        List<PolicyStore.Policy> passed = List.of();
+        if (!scopes.isEmpty()) {
+            passed = scopeHits(scopes, dbType, op, tables, defaultNamespace);
+            if (passed == null) {
+                return Decision.of(Kind.DENY, "超出数据范围, 已拒绝执行", label(scopes));
+            }
+        }
+        if (lists.isEmpty()) {
+            return settle(List.of(), passed, "ALLOW", "在数据范围内");
+        }
+        List<PolicyStore.Policy> deny = topPriority(matchOp(lists, PolicyStore.TYPE_BLACKLIST, op));
+        List<PolicyStore.Policy> allow = topPriority(matchOp(lists, PolicyStore.TYPE_WHITELIST, op));
+        if (deny.isEmpty() && allow.isEmpty()) {
+            // 数据范围只能更严, 不能替代白名单: 有黑白名单而 op 没被放行, 范围内也照拒
+            return Decision.of(Kind.DENY, "未命中任何白名单, 该智能体已配置访问控制策略", label(lists));
+        }
+        List<PolicyStore.Policy> allowSide = new ArrayList<>(allow);
+        allowSide.addAll(passed);
+        return deny.isEmpty() ? settle(deny, allowSide, "ALLOW", "命中白名单") : settle(deny, allowSide, "DENY", "命中黑名单");
+    }
+
+    /** 快照里属于某一类 (HOST / DATABASE) 的策略 */
+    private List<PolicyStore.Policy> policies(boolean database) {
+        List<PolicyStore.Policy> out = new ArrayList<>();
+        for (PolicyStore.Policy p : store.snapshot().policies()) {
+            if (p.database() == database) {
+                out.add(p);
+            }
+        }
+        return out;
+    }
+
+    /** 黑白名单之前的两道无条件拒绝 (规则无效、限流超限); 都没触发返回 null */
+    private Decision precheck(List<PolicyStore.Policy> applicable, List<PolicyStore.Policy> rates) {
         // 无效优先: 规则读不出来的策略不能当"没有这条策略"跳过 —— 丢掉的可能是 deny 项,
         // 后面再有一条白名单命中就变成放行了 (设计文档: 无效规则按拒绝处理)
         for (PolicyStore.Policy p : applicable) {
@@ -189,34 +310,18 @@ public class PolicyDecider {
                 return Decision.of(Kind.DENY, "超出频率限制, 已拒绝执行", label(List.of(p)));
             }
         }
-        if (applicable.isEmpty()) {
-            // 该智能体没有黑白名单 (压根没策略, 或只有限流策略) → 维持接入前的现状放行.
-            // 只有限流的智能体绝不能落到"未命中任何白名单": 那等于配了限流就把所有命令封死
-            return Decision.of(Kind.ALLOW, null, null);
-        }
-        Parsed parsed = parse(command);
-        List<PolicyStore.Policy> gov;
-        String base;
-        String why;
+        return null;
+    }
 
-        // 黑/白名单各自按优先级收敛后再往下走: 以下的 deny-wins、抬档、policyRevision 原样吃收敛后的集合
-        List<PolicyStore.Policy> deny = topPriority(matchDeny(applicable, parsed));
-        List<PolicyStore.Policy> allow = topPriority(matchAllow(applicable, parsed));
-        if (!deny.isEmpty()) {
-            gov = deny;
-            base = "DENY";
-            why = "命中黑名单";
-        } else {
-            if (allow.isEmpty()) {
-                // 严格模式: 该智能体有策略但这条命令未被明确允许
-                return Decision.of(Kind.DENY, "未命中任何白名单, 该智能体已配置访问控制策略", label(applicable));
-            }
-            gov = allow;
-            boolean clean = !parsed.compound() && !parsed.explicitPath();
-            base = clean ? "ALLOW" : "DENY";
-            why = clean ? "命中白名单" : parsed.compound() ? "复合命令不允许白名单自动放行" : "显式路径命令不允许白名单自动放行";
-        }
-
+    /**
+     * 黑白名单命中后的档位合并 (HOST / DATABASE 共用)
+     *
+     * @param deny 收敛后的黑名单命中集; 非空即 deny 基调
+     * @param allow 收敛后的白名单命中集
+     * @param base  deny 为空时白名单给出的基调 (HOST 的复合命令/显式路径会给 DENY)
+     */
+    private static Decision settle(List<PolicyStore.Policy> deny, List<PolicyStore.Policy> allow, String base, String why) {
+        List<PolicyStore.Policy> gov = deny.isEmpty() ? allow : deny;
         // 拒判基调下取档位的次序**与白名单那边相反**: 黑名单的 NONE 是"无条件拒绝", 比 CONFIRM 严;
         // 照白名单的 NONE < CONFIRM 取最大, "一条 NONE + 一条 CONFIRM"会变成可确认放行.
         // 所以只有"全部命中黑名单都是 CONFIRM"才允许本人确认
@@ -251,6 +356,124 @@ public class PolicyDecider {
                         ? Decision.of(Kind.ALLOW, why, policyLabel)
                         : Decision.of(Kind.DENY, why, policyLabel);
         }
+    }
+
+    /** DATABASE 黑/白名单命中集: 策略任一操作项 EXACT 等于 op 即命中 (与 HOST 的 anyHit 同口径, 不做交集) */
+    private static List<PolicyStore.Policy> matchOp(List<PolicyStore.Policy> policies, String type, String op) {
+        List<PolicyStore.Policy> out = new ArrayList<>();
+        for (PolicyStore.Policy p : policies) {
+            if (!type.equals(p.type())) {
+                continue;
+            }
+            for (PolicyStore.Op o : p.ops()) {
+                if ("EXACT".equals(o.matchType()) && o.value() != null && o.value().equalsIgnoreCase(op)) {
+                    out.add(p);
+                    break;
+                }
+            }
+        }
+        return out;
+    }
+
+    /**
+     * DATA_SCOPE 判定: tables 非空且每张表都至少命中一条表规则 (任一 DATA_SCOPE 策略的规则都算, 与白名单
+     * anyHit 同口径, 不做交集). 不通过返回 null; 通过则返回参与档位合并的那几条策略
+     * <p>
+     * 返回集与 HOST 同样是"先命中、再按优先级": 逐张表收集命中它的 DATA_SCOPE, 在这张表的命中集内取
+     * topPriority, 再对所有表取并集 (去重保序)。不能直接对全部适用的 DATA_SCOPE 取 topPriority ——
+     * 一条高优先级但没命中任何表的 NONE 会盖掉真正放行这张表的 APPROVAL, 审批被绕开; 同优先级没命中的
+     * 也不该混进 matched 平白抬档或让 policyRevision 抖动
+     * <p>
+     * 唯一例外是 op=SHOW 且 tables 为空 (SHOW TABLES / SHOW DATABASES 等): 只暴露名称不暴露数据, 放行
+     * (用户拍板); 没有表可命中, 返回集取全部适用 DATA_SCOPE 的 topPriority. 其余 tables 为空 (如
+     * {@code SELECT 1}, 或解析不完整) 一律不通过 —— fail-close, 解析不出表就当成"不知道碰了哪些表"
+     */
+    private static List<PolicyStore.Policy> scopeHits(List<PolicyStore.Policy> scopes, String dbType, String op,
+                                                      List<String> tables, String defaultNamespace) {
+        if (tables == null || tables.isEmpty()) {
+            return "SHOW".equalsIgnoreCase(op) ? topPriority(scopes) : null;
+        }
+        List<PolicyStore.Policy> out = new ArrayList<>();
+        for (String table : tables) {
+            List<PolicyStore.Policy> hits = new ArrayList<>();
+            for (PolicyStore.Policy p : scopes) {
+                for (PolicyStore.Table rule : p.tables()) {
+                    if (tableHit(rule, dbType, table, defaultNamespace)) {
+                        hits.add(p);
+                        break;
+                    }
+                }
+            }
+            if (hits.isEmpty()) {
+                return null;
+            }
+            for (PolicyStore.Policy p : topPriority(hits)) {
+                if (!out.contains(p)) {
+                    out.add(p);
+                }
+            }
+        }
+        return out;
+    }
+
+    /**
+     * 单条表规则是否命中一张表 (设计文档 §3.6)
+     * <p>
+     * 两侧先按库类型做同样的大小写规范化, 再各自补全成 {@code 命名空间.表}:
+     * 策略写裸名 {@code user} 只代表<b>默认命名空间</b>里的 user, 不匹配 {@code other.user};
+     * 写 {@code 库.表} 按完整名匹配。命名空间部分一律精确相等, PREFIX / SUFFIX 只作用于表名部分 ——
+     * 否则 PREFIX {@code order_} 会顺带放行 {@code order_db.secret} 这种"库名碰巧同前缀"的表
+     *
+     * @param table DBC 给出的已规范化 {@code 命名空间.表}; 万一没带命名空间, 同样补默认命名空间
+     */
+    static boolean tableHit(PolicyStore.Table rule, String dbType, String table, String defaultNamespace) {
+        String ns = foldCase(dbType, defaultNamespace);
+        String[] target = qualify(foldCase(dbType, table), ns);
+        String[] want = qualify(foldCase(dbType, rule.tableName()), ns);
+        if (target == null || want == null || !want[0].equals(target[0])) {
+            return false;
+        }
+        return switch (rule.matchType()) {
+            case "EXACT" -> target[1].equals(want[1]);
+            case "PREFIX" -> target[1].startsWith(want[1]);
+            case "SUFFIX" -> target[1].endsWith(want[1]);
+            default -> false;
+        };
+    }
+
+    /**
+     * 拆成 {命名空间, 表}: 按第一个 '.' 切 (命名空间里不会有点); 没有点的补默认命名空间,
+     * 默认命名空间缺失时返回 null —— 补不出来就不算命中 (fail-close), 不能退化成"任意命名空间"
+     * <p>
+     * 任一段为空 ({@code sales.} / {@code .x} / {@code a..b}) 一律 null: 否则 PREFIX {@code sales.}
+     * 的表名部分是空串, startsWith("") 恒真, 等于悄悄放开整个命名空间
+     */
+    private static String[] qualify(String name, String defaultNamespace) {
+        if (name == null || name.isEmpty() || name.startsWith(".") || name.endsWith(".") || name.contains("..")) {
+            return null;
+        }
+        int dot = name.indexOf('.');
+        if (dot >= 0) {
+            return new String[]{name.substring(0, dot), name.substring(dot + 1)};
+        }
+        return defaultNamespace == null || defaultNamespace.isEmpty() ? null : new String[]{defaultNamespace, name};
+    }
+
+    /**
+     * 标识符大小写按库类型规范化 (与 DBC 同口径): ORACLE / DAMENG 大写, POSTGRESQL 小写, 其余 (含 MYSQL) 原样
+     * <p>
+     * 本期只开放 MYSQL / POSTGRESQL / ORACLE / DAMENG 四种 (DBC wdb.agent.db-types); 其他类型要开放时,
+     * 必须与 DBC 侧的标识符规范化规则一起加, 两端口径不一致会让表规则静默不命中或错命中
+     */
+    static String foldCase(String dbType, String s) {
+        if (s == null || dbType == null) {
+            return s;
+        }
+        return switch (dbType) {
+            case "ORACLE", "DAMENG" -> s.toUpperCase(Locale.ROOT);
+            case "POSTGRESQL" -> s.toLowerCase(Locale.ROOT);
+            default -> s;
+        };
     }
 
     /**
@@ -372,12 +595,26 @@ public class PolicyDecider {
 
     /** 包级重载: 同样供测试注入时刻 */
     void recordRate(long agentId, String hostType, Long hostId, ZonedDateTime now) {
+        record(false, agentId, hostType, hostId, now);
+    }
+
+    /** DATABASE 类放行执行时记账, 口径同 {@link #recordRate(long, String, Long)} */
+    public void recordDatabaseRate(long agentId, String dbType, Long hostId) {
+        recordDatabaseRate(agentId, dbType, hostId, ZonedDateTime.now(BUSINESS_ZONE));
+    }
+
+    /** 包级重载: 同样供测试注入时刻 */
+    void recordDatabaseRate(long agentId, String dbType, Long hostId, ZonedDateTime now) {
+        record(true, agentId, dbType, hostId, now);
+    }
+
+    private void record(boolean database, long agentId, String hostType, Long hostId, ZonedDateTime now) {
         if (hostId == null) {
             return;
         }
         // 与 decide() 里的超限判定必须是同一个收敛结果: 只给最高优先级那几条记账,
         // 被盖掉的限流器不累计 —— 否则它在"升回最高优先级"那一刻就带着一堆偷偷攒下的计数直接超限
-        for (PolicyStore.Policy p : topPriority(ratePolicies(store.snapshot().policies(), agentId, hostType, hostId, now))) {
+        for (PolicyStore.Policy p : topPriority(ratePolicies(policies(database), agentId, hostType, hostId, now))) {
             limiter.record(p.id(), p.windowSeconds());
         }
     }
@@ -635,6 +872,9 @@ public class PolicyDecider {
         if (PolicyStore.TYPE_WHITELIST.equals(type)) {
             return "操作白名单";
         }
+        if (PolicyStore.TYPE_DATA_SCOPE.equals(type)) {
+            return "数据范围限制";
+        }
         return type;
     }
 
@@ -668,6 +908,14 @@ public class PolicyDecider {
                 // 十进制数字不含 ':', 随后恰好消费该长度个字符（内容任意）——整条编码因此是无歧义的
                 String value = op.value() == null ? "" : op.value();
                 canonical.append(op.matchType()).append(':').append(value.length()).append(':').append(value).append(';');
+            }
+            // DATA_SCOPE 的表规则也要进摘要 (改了范围 = 改了命中策略内容); 只对 DATA_SCOPE 追加,
+            // HOST 类摘要必须逐字节不变 —— 升级前后在途审批单的 policyRevision 靠它比对
+            if (PolicyStore.TYPE_DATA_SCOPE.equals(p.type())) {
+                for (PolicyStore.Table t : p.tables()) {
+                    canonical.append("T:").append(t.matchType()).append(':').append(t.tableName().length())
+                            .append(':').append(t.tableName()).append(';');
+                }
             }
             canonical.append('\n');
         }

@@ -28,6 +28,9 @@ public class McpRequestFilter implements Filter {
     /** request attribute / McpTransportContext 键 */
     public static final String CREDENTIAL = "soag.credential";
 
+    /** 固定资源模式的原始虚拟凭据: 数据库工具在长时间确认等待后据此续签 DBC 票据 */
+    public static final String VIRTUAL_TOKEN = "soag.virtualToken";
+
     /** 用户自选模式的可信身份 (ConsoleClient.ResolvedUser) */
     public static final String USER_IDENTITY = "soag.userIdentity";
 
@@ -164,6 +167,7 @@ public class McpRequestFilter implements Filter {
         }
         if (credential != null) {
             req.setAttribute(CREDENTIAL, credential);
+            req.setAttribute(VIRTUAL_TOKEN, token);
         } else {
             req.setAttribute(USER_IDENTITY, identity);
             req.setAttribute(USER_TOKEN, userToken);
@@ -244,6 +248,11 @@ public class McpRequestFilter implements Filter {
     /** 工具方法从 McpTransportContext 取可信用户身份 (用户自选模式才有) */
     public static ConsoleClient.ResolvedUser userIdentity(McpTransportContext ctx) {
         return ctx == null ? null : (ConsoleClient.ResolvedUser) ctx.get(USER_IDENTITY);
+    }
+
+    /** 工具方法从 McpTransportContext 取原始虚拟凭据 (固定资源模式才有, 续签 DBC 票据用) */
+    public static String virtualToken(McpTransportContext ctx) {
+        return ctx == null ? null : (String) ctx.get(VIRTUAL_TOKEN);
     }
 
     /** 工具方法从 McpTransportContext 取 TCP 对端地址 (透传控制台做智能体 IP 范围校验) */

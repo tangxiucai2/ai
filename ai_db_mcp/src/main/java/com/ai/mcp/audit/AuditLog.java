@@ -40,6 +40,10 @@ public class AuditLog {
     public static final String FAILED = "FAILED";
     public static final String DENIED = "DENIED";
 
+    /** 数据库工具在结果里带给审计的内部字段 (DBC 解析出的 op / tables), 读完即摘掉不外传 */
+    public static final String AUDIT_OP = "auditOp";
+    public static final String AUDIT_TABLES = "auditTables";
+
     private final ArrayDeque<Entry> ring = new ArrayDeque<>();
     private final AuditSpool spool;
     private final ObjectMapper json;
@@ -74,7 +78,8 @@ public class AuditLog {
     /** 上报控制台的事件 (比 Entry 多身份/结果字段) */
     private record Event(String id, String connectionId, long time, long costMs, Long agentId, String agentCode, Long credentialId,
                          String userName, String userId, String srcIp, String tool, String type, String status,
-                         String denySource, String summary, String result, Integer lines, String error) {
+                         String denySource, String summary, String result, Integer lines, String error,
+                         String op, List<String> tables, Boolean truncated) {
     }
 
     /**
@@ -98,7 +103,8 @@ public class AuditLog {
         try {
             r = call.get();
         } catch (RuntimeException e) {
-            record(pick(cred, auditCtx), identity, srcIp, userId, tool, summary, t0, requestId, FAILED, null, e.toString(), connectionId, null, null);
+            record(pick(cred, auditCtx), identity, srcIp, userId, tool, summary, t0, requestId, FAILED, null, e.toString(), connectionId, null, null,
+                    null, null, null);
             throw e;
         }
         // SSH 命令: 工具协议里非零退出码仍 success=true, 审计按退出码判失败并保留 stderr
@@ -109,18 +115,25 @@ public class AuditLog {
         // 控制台据此把拒绝分类区分开; 这里读完即摘掉, 不让内部字段泄漏给客户端
         String denySource = r == null ? null : (String) r.remove("denySource");
         // auditError 是拒绝时的审计全文 (带策略名与规则摘要), 对外 error 里已经没有这些 ——
-        // 同样读完即摘掉不外传, 否则等于把规则原文又递回给调用方
+        // 同样读完即摘掉不外传, 否则等于把规则原文又递回给调用方; DBC 内部错误/不可达也用它保留详情
         String auditError = r == null ? null : (String) r.remove("auditError");
+        // 数据库类: DBC 解析出的 op / tables (解析阶段就被拒时没有), truncated 是对外结果字段, 只读不摘
+        String op = r == null ? null : (String) r.remove(AUDIT_OP);
+        @SuppressWarnings("unchecked")
+        List<String> tables = r == null ? null : (List<String>) r.remove(AUDIT_TABLES);
+        Boolean truncated = r == null || !(r.get("truncated") instanceof Boolean b) ? null : b;
         boolean denied = denySource != null;
         boolean ok = r != null && Boolean.TRUE.equals(r.get("success")) && !nonZero;
         String cid = connectionId != null || r == null ? connectionId : (String) r.get("connectionId");
         String error = ok || r == null ? null
                 : nonZero ? "exit=" + exit + (r.get("errorOutput") == null ? "" : " " + r.get("errorOutput"))
-                : denied && auditError != null ? auditError
+                : auditError != null ? auditError
                 : String.valueOf(r.get("error"));
         Object[] res = resultOf(tool, r);
+        // SQL 被拒时行数记 0 (设计文档 2026-09-29 §3.4)
+        Integer lines = denied && "db_execute".equals(tool) ? Integer.valueOf(0) : (Integer) res[1];
         record(pick(cred, auditCtx), identity, srcIp, userId, tool, summary, t0, requestId, ok ? SUCCESS : denied ? DENIED : FAILED,
-                denySource, error, cid, (String) res[0], (Integer) res[1]);
+                denySource, error, cid, (String) res[0], lines, op, tables, truncated);
         return r;
     }
 
@@ -129,10 +142,10 @@ public class AuditLog {
         long now = System.currentTimeMillis();
         add(new Entry(now, line(dash(agent)), line(dash(user)), "auth", "鉴权", "-", reason, 0, DENIED, reason, null));
         spool(new Event(nextId(now), null, now, 0, null, agent, null, user, userId, srcIp, "auth", "denied", DENIED,
-                PolicyDecider.Source.AUTH.name(), reason, null, null, reason));
+                PolicyDecider.Source.AUTH.name(), reason, null, null, reason, null, null, null));
     }
 
-    /** 工具返回值 → 结果摘要 + 行数: SSH 取 stdout 前 2000 字与行数; SQL 查询取行数/列; 更新取影响行数; 事务取语句数/影响行数 */
+    /** 工具返回值 → 结果摘要 + 行数: SSH 取 stdout 前 2000 字与行数; SQL 查询取行数/列; 更新取影响行数 */
     @SuppressWarnings("unchecked")
     private static Object[] resultOf(String tool, Map<String, Object> r) {
         if (r == null) {
@@ -148,15 +161,6 @@ public class AuditLog {
         }
         if (r.get("affectedRows") instanceof Number n) {
             return new Object[]{"affectedRows=" + n, n.intValue()};
-        }
-        if (r.get("results") instanceof List<?> list) {
-            long affected = 0;
-            for (Object o : list) {
-                if (o instanceof Map<?, ?> m && m.get("affectedRows") instanceof Number n) {
-                    affected += n.longValue();
-                }
-            }
-            return new Object[]{"statements=" + list.size() + " affectedRows=" + affected, list.size()};
         }
         return new Object[]{null, null};
     }
@@ -190,7 +194,8 @@ public class AuditLog {
      */
     private void record(ConsoleClient.Resolved cred, ConsoleClient.ResolvedUser identity, String srcIp, String userId,
                         String tool, String summary, long t0, String requestId,
-                        String status, String denySource, String error, String cid, String result, Integer lines) {
+                        String status, String denySource, String error, String cid, String result, Integer lines,
+                        String op, List<String> tables, Boolean truncated) {
         String s = summary == null ? "" : cut(summary, SUMMARY_MAX);
         error = error == null ? null : cut(error, ERROR_MAX);
         long cost = System.currentTimeMillis() - t0;
@@ -209,7 +214,7 @@ public class AuditLog {
         // requestId 是 run() 入口已经生成好的裸 id, 这里不再调 nextId() (设计文档结论 22)
         spool(new Event(requestId, cid, t0, cost, agentId, agentCode,
                 credentialId, userName, userId, srcIp,
-                tool, eventType(tool, s), status, denySource, s, result, lines, error));
+                tool, op != null ? op : eventType(tool, s), status, denySource, s, result, lines, error, op, tables, truncated));
     }
 
     /** 不上报控制台的工具: 没有资源访问行为, 记进审计日志只是噪音 */
@@ -221,7 +226,6 @@ public class AuditLog {
             case "ssh_connect", "db_create_connection" -> "connect";
             case "ssh_disconnect", "db_close_connection" -> "disconnect";
             case "ssh_execute", "ssh_execute_long_running" -> "command";
-            case "db_execute_transaction" -> "transaction";
             case "db_execute" -> {
                 String head = sql == null ? "" : sql.trim().toUpperCase(Locale.ROOT);
                 int sp = head.indexOf(' ');
@@ -284,7 +288,6 @@ public class AuditLog {
             case "ssh_execute", "ssh_execute_long_running" -> "SSH命令";
             case "db_create_connection" -> "DB连接";
             case "db_close_connection" -> "DB断开";
-            case "db_execute_transaction" -> "SQL事务";
             case "db_execute" -> sqlType(summary);
             case "list_credentials" -> "凭据查询";
             default -> tool;

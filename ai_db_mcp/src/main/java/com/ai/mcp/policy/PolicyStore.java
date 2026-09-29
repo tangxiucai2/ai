@@ -43,6 +43,22 @@ public class PolicyStore {
     public static final String TYPE_BLACKLIST = "BLACKLIST";
     /** 频率限制: 网关不执行 (快照里也没有限额字段), 只当它不存在 */
     public static final String TYPE_RATE_LIMIT = "RATE_LIMIT";
+    /** 数据范围: 仅 DATABASE 类, 规则是表名清单 (tables), 不带 ops */
+    public static final String TYPE_DATA_SCOPE = "DATA_SCOPE";
+
+    /** HOST 类唯一的资源主类型; 其余 hostType 一律归 DATABASE 类 (控制台只下发这两类) */
+    public static final String HOST_TYPE_SSH = "SSH";
+
+    /** DATABASE 类操作值域 (十项, 大写, 只允许 EXACT); 与控制台 AgentAccessPolicyRules.DB_OPS 一字不差 */
+    static final Set<String> DB_OPS = Set.of(
+            "SELECT", "INSERT", "UPDATE", "DELETE", "DROP", "TRUNCATE", "ALTER", "CREATE", "SHOW", "DESCRIBE");
+
+    /** 表规则匹配方式值域 */
+    private static final Set<String> TABLE_MATCH_TYPES = Set.of("EXACT", "PREFIX", "SUFFIX");
+
+    /** 表名值域: 与控制台 AgentAccessPolicyRules.TABLE_NAME 同口径 (可含一个 "库." 前缀) */
+    private static final java.util.regex.Pattern TABLE_NAME =
+            java.util.regex.Pattern.compile("^[A-Za-z0-9_$.\u4e00-\u9fa5]{1,64}$");
 
     /** 人工介入档位; 未知值按「快照无效」处理, 不能静默降级成 NONE */
     private static final Set<String> APPROVAL_MODES = Set.of("NONE", "CONFIRM", "APPROVAL", "BOTH");
@@ -77,7 +93,15 @@ public class PolicyStore {
     }
 
     /**
-     * 一条启用中的 HOST 类策略; type=RATE_LIMIT 的不参与黑白名单匹配 (见 {@code PolicyDecider.applicable})
+     * 一条 DATA_SCOPE 表规则: 表名原值 (可为裸名或 {@code 库.表}) + 匹配方式 (EXACT/PREFIX/SUFFIX)
+     * <p>
+     * 原值保留, 大小写规范化与补默认命名空间在裁决时按库类型做 (见 {@code PolicyDecider.tableHit})
+     */
+    public record Table(String tableName, String matchType) {
+    }
+
+    /**
+     * 一条启用中的 HOST / DATABASE 类策略 (按 {@link #database()} 区分); type=RATE_LIMIT 的不参与黑白名单匹配 (见 {@code PolicyDecider.applicable})
      *
      * @param hostIds      目标资源 id 集合; 单元素 {@code [0]} 是「该 hostType 下全部资源」的哨兵.
      *                     非空, 且 0 不与具体 id 混排 (解析期已保证, 见 {@code fetch})
@@ -93,12 +117,21 @@ public class PolicyStore {
      * @param actionTimeEnd   结束时间原值, 格式同 actionTimeStart
      * @param priority        优先级 1~100, 数值越小越优先; 缺失字段折成 {@code 50}, 存在但非法直接 fetch() 失败.
      *                        同类型多条**命中**时只由优先级最高的那几条决定档位 (见 {@code PolicyDecider.topPriority})
+     * @param tables          仅 DATA_SCOPE: 表规则; 其余类型恒为空列表
      */
     public record Policy(long id, String name, String type, String hostType, List<Long> hostIds, List<Long> agentIds,
                          String approvalMode, boolean rulesInvalid, String rulesSummary, List<Op> ops,
                          long limit, long windowSeconds,
                          String actionTimeType, String actionTimeStart, String actionTimeEnd,
-                         int priority) {
+                         int priority, List<Table> tables) {
+
+        /**
+         * 是否 DATABASE 类: 按 hostType 静态归类 (与控制台 category() 同口径), 不看 type ——
+         * HOST 裁决只看 HOST 类、DATABASE 裁决只看 DATABASE 类, 两类互不串 (改造前快照只有 HOST 类)
+         */
+        public boolean database() {
+            return !HOST_TYPE_SSH.equals(hostType);
+        }
     }
 
     public record Snapshot(String version, List<Policy> policies) {
@@ -250,6 +283,7 @@ public class PolicyStore {
             if (!opsNode.isArray() && !invalid) {
                 throw new IllegalStateException("策略快照条目的 ops 缺失或不是数组: " + p);
             }
+            boolean database = !HOST_TYPE_SSH.equals(p.path("hostType").asText());
             List<Op> ops = new ArrayList<>();
             for (JsonNode o : opsNode) {
                 JsonNode valueNode = o.path("value");
@@ -268,7 +302,11 @@ public class PolicyStore {
                 // matchType 不在值域内, 或 value 不在值域内, 是同一类"语义上读不出来": 交给
                 // PolicyDecider 的话, governs() 的 switch 落到 default 就是静默"不匹配" ——
                 // 黑名单少一项 deny, 这项要么在这里直接堵掉, 要么整个策略按拒绝处理 (跟上面同一套口径)
-                if (!OP_MATCH_TYPES.contains(matchType) || !validOpValue(opValue, matchType)) {
+                // DATABASE 类再收窄: 只许 EXACT 且值在十项操作内 (控制台写入时已校验, 这里不跨进程信任);
+                // 大小写不敏感 —— 控制台落库前大写化, 但存量行可能仍是小写, 裁决侧同样按不敏感比较
+                if (!OP_MATCH_TYPES.contains(matchType) || !validOpValue(opValue, matchType)
+                        || database && !("EXACT".equals(matchType)
+                        && DB_OPS.contains(opValue.toUpperCase(java.util.Locale.ROOT)))) {
                     if (!invalid) {
                         throw new IllegalStateException("策略快照条目的操作项无法解析 (matchType 未知或值域非法): " + p);
                     }
@@ -287,6 +325,7 @@ public class PolicyStore {
                 }
                 ops.add(new Op(opValue, matchType, pattern));
             }
+            List<Table> tables = TYPE_DATA_SCOPE.equals(type) ? parseTables(p, invalid) : List.of();
             // rulesSummary 展示用可空 (规则无效时控制台本就不下发有意义的摘要), 不必牵连整次拉取失败
             String rulesSummary = p.path("rulesSummary").isTextual() ? p.path("rulesSummary").asText() : null;
             // actionTimeStart/End 保留**原值**(可能为 null): 非法的那些已由 actionTimeValid 标成 invalid,
@@ -301,9 +340,39 @@ public class PolicyStore {
                     actionTimeType,
                     timeStartNode.isTextual() ? timeStartNode.asText() : null,
                     timeEndNode.isTextual() ? timeEndNode.asText() : null,
-                    priority));
+                    priority, tables));
         }
         return new Snapshot(versionNode.asText(), List.copyOf(policies));
+    }
+
+    /**
+     * DATA_SCOPE 表规则: 与 ops 同一套 fail-closed 口径 —— rulesInvalid=false 时 tables 缺失/不是数组/
+     * 某项读不出来/值域非法, 一律整次拉取失败 (静默丢一项等于把数据范围悄悄改宽或改窄);
+     * rulesInvalid=true 的策略整体按拒绝处理, 表规则内容不影响裁决, 读不出来的项直接跳过
+     */
+    private static List<Table> parseTables(JsonNode p, boolean invalid) {
+        JsonNode node = p.path("tables");
+        if (!node.isArray()) {
+            if (!invalid) {
+                throw new IllegalStateException("策略快照条目的 tables 缺失或不是数组: " + p);
+            }
+            return List.of();
+        }
+        List<Table> tables = new ArrayList<>();
+        for (JsonNode t : node) {
+            JsonNode nameNode = t.path("tableName");
+            JsonNode matchTypeNode = t.path("matchType");
+            if (!nameNode.isTextual() || !matchTypeNode.isTextual()
+                    || !TABLE_MATCH_TYPES.contains(matchTypeNode.asText())
+                    || !TABLE_NAME.matcher(nameNode.asText()).matches()) {
+                if (!invalid) {
+                    throw new IllegalStateException("策略快照条目的表规则无法解析: " + p);
+                }
+                continue;
+            }
+            tables.add(new Table(nameNode.asText(), matchTypeNode.asText()));
+        }
+        return List.copyOf(tables);
     }
 
     /**
