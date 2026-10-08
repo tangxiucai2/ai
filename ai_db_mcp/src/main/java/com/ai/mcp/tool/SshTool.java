@@ -186,9 +186,9 @@ public class SshTool {
      * 策略判定 → 拒绝原因; 通过返回 null
      * <p>
      * 等过人工确认的判定要再校验一次: 确认最长阻塞控制台下发的确认超时(至多 300 秒), 期间凭据可能被撤销/过期。
-     * <b>但真正回控制台重校验的只有用户自选模式</b> —— 固定资源模式在 {@link ToolAuth#verdict} 里直接返回
-     * 放行 (阶段二既定口径: 身份本就不可信, 每次操作都回控制台既改变存量行为又白付性能), 那种模式下
-     * 这里只剩「句柄还在 + 本地归属匹配」, 与 lookup 开头那次等价, 不构成额外的撤权保护。
+     * 复检走 {@link ToolAuth#checkAfterWait}: 用户自选模式与实名固定资源 (携带 X-User-Token) 都实时回控制台
+     * 重校验, 等待期间 Token 被停用即不执行; 匿名固定资源无身份可校, 直接放行, 这里只剩「句柄还在 + 本地归属匹配」,
+     * 与 lookup 开头那次等价。
      * 没等确认的路径不重复校验 —— lookup 刚刚校验过, 再来一次是白付一次控制台往返
      * <p>
      * 来源以判定自带的为准, 只有"确认等完发现授权已被撤"这一支不是判定产出的 —— 那是复检拦下的,
@@ -216,14 +216,14 @@ public class SshTool {
     /**
      * 授权是否仍然有效 (确认等待后的复检)
      * <p>
-     * 用户自选模式回控制台按连接元数据里的 credentialId 重校验;
-     * 固定资源模式不重校验 (见 {@link ToolAuth#verdict}), 这里相当于只确认句柄与归属还在
+     * 用户自选模式回控制台按连接元数据里的 credentialId 重校验; 固定资源实名连接用 X-User-Token 实时 resolve;
+     * 匿名固定资源不重校验 (见 {@link ToolAuth#checkAfterWait}), 这里相当于只确认句柄与归属还在
      *
      * @return 重校验结果; 句柄已不存在或归属不符返回 null (未回控制台)
      */
     private ToolAuth.Check stillAuthorized(String connectionId, McpTransportContext ctx) {
         Conn<Session> conn = reaper.peek(connectionId);
-        return conn == null || !conn.meta().accessibleBy(ctx) ? null : ToolAuth.check(ctx, conn.meta());
+        return conn == null || !conn.meta().accessibleBy(ctx) ? null : ToolAuth.checkAfterWait(ctx, conn.meta());
     }
 
     /**

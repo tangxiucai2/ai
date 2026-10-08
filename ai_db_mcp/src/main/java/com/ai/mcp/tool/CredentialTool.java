@@ -42,6 +42,12 @@ public class CredentialTool {
 
     private Map<String, Object> list_credentials0(String keyword, McpTransportContext ctx) {
         Map<String, Object> result = new HashMap<>();
+        // 固定资源连接只绑一个凭据, 带不带 X-User-Token 都不能列凭据; 提示「补 Token」会误导调用方去加头后仍失败
+        if (McpRequestFilter.credential(ctx) != null) {
+            result.put("success", false);
+            result.put("error", "固定资源模式 (携带 X-Virtual-Token) 不支持列出凭据, 请改用用户自选模式 (仅携带 X-User-Token)");
+            return result;
+        }
         ConsoleClient.ResolvedUser identity = McpRequestFilter.userIdentity(ctx);
         if (identity == null) {
             result.put("success", false);

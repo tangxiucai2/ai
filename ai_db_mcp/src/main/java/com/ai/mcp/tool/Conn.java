@@ -4,6 +4,8 @@ import com.ai.mcp.config.ConsoleClient;
 import io.modelcontextprotocol.common.McpTransportContext;
 import com.ai.mcp.config.McpRequestFilter;
 
+import java.util.Objects;
+
 /**
  * 连接条目: 句柄与归属元数据合并成一个 entry, 一次 put/remove
  * <p>
@@ -12,7 +14,7 @@ import com.ai.mcp.config.McpRequestFilter;
  */
 public record Conn<T>(T handle, ConnMeta meta) {
 
-    /** 固定资源模式: 凭据来自 X-Virtual-Token, 身份不可信 */
+    /** 固定资源模式: 凭据来自 X-Virtual-Token, 用户身份来自可选的 X-User-Token (不带为匿名) */
     public static final String MODE_CREDENTIAL = "CREDENTIAL";
 
     /** 用户自选模式: 身份来自 X-User-Token, 可信 */
@@ -26,9 +28,9 @@ public record Conn<T>(T handle, ConnMeta meta) {
      */
     public record ConnMeta(String authMode, long agentId, Long userId, long credentialId, String resource) {
 
-        /** 固定资源模式的归属 */
+        /** 固定资源模式的归属: userId 为 Token 反查的可信用户, 匿名为 null */
         public static ConnMeta ofCredential(ConsoleClient.Resolved cred, String resource) {
-            return new ConnMeta(MODE_CREDENTIAL, cred.agentId(), null, cred.credentialId(), resource);
+            return new ConnMeta(MODE_CREDENTIAL, cred.agentId(), cred.userId(), cred.credentialId(), resource);
         }
 
         /** 用户自选模式的归属 */
@@ -38,13 +40,17 @@ public record Conn<T>(T handle, ConnMeta meta) {
 
         /**
          * 当前请求能否访问该连接: 模式必须一致, 智能体必须一致, 用户模式还要求用户一致
+         * <p>
+         * 固定资源模式按 Objects.equals 比用户 (含 null): 匿名只能访问匿名连接, 实名只能访问本人连接,
+         * 匿名之间仍共享; 否则跨身份共用连接会串用 DBC 票据里的操作人
          */
         public boolean accessibleBy(McpTransportContext ctx) {
             ConsoleClient.Resolved cred = McpRequestFilter.credential(ctx);
             if (cred != null) {
                 return MODE_CREDENTIAL.equals(authMode)
                         && cred.agentId() == agentId
-                        && cred.credentialId() == credentialId;
+                        && cred.credentialId() == credentialId
+                        && Objects.equals(userId, cred.userId());
             }
             ConsoleClient.ResolvedUser identity = McpRequestFilter.userIdentity(ctx);
             return identity != null

@@ -114,6 +114,25 @@ class PolicyGateDatabaseTest {
         assertEquals("db_execute", console.gateBodies.get(0).get("tool"));
     }
 
+    /** 固定资源审批带 Token 反查的可信 userId/userName (审批指纹按用户隔离); 匿名不带 userId */
+    @Test
+    void approvalCarriesFixedResourceTrustedUser() {
+        setUp(policy(1, PolicyStore.TYPE_WHITELIST, "MYSQL", "APPROVAL", "UPDATE"));
+        console.result = new ConsoleClient.ApprovalGateResult("PENDING", 1L, "AP-1", 1L, null, null);
+        ConsoleClient.Resolved named = new ConsoleClient.Resolved(7, 9, "DATABASE", "MYSQL", "10.0.0.1", 3306,
+                "appdb", "u", null, "agent-7", "bob", 1L, null, 6L);
+        gate.checkDatabase(McpTransportContext.create(Map.of(McpRequestFilter.CREDENTIAL, named)),
+                null, SQL, "UPDATE", List.of("appdb.order_a"), "appdb", "db_execute");
+        assertEquals(6L, console.gateBodies.get(0).get("userId"));
+        assertEquals("bob", console.gateBodies.get(0).get("userName"));
+
+        ConsoleClient.Resolved anon = new ConsoleClient.Resolved(7, 9, "DATABASE", "MYSQL", "10.0.0.1", 3306,
+                "appdb", "u", null, "agent-7", null, 1L);
+        gate.checkDatabase(McpTransportContext.create(Map.of(McpRequestFilter.CREDENTIAL, anon)),
+                null, SQL, "UPDATE", List.of("appdb.order_a"), "appdb", "db_execute");
+        assertFalse(console.gateBodies.get(1).containsKey("userId"));
+    }
+
     /** P4 后半: 审批通过, 策略未变 → fresh decide 的 policyRevision 相等 → 放行 */
     @Test
     void approvalAllowWhenRevisionUnchanged() {

@@ -43,6 +43,7 @@ class DatabaseToolDbcTest {
         ConsoleClient.Resolved renewed;
         boolean reject;
         int renewCalls;
+        String lastUserToken;
 
         @Override
         public Map<String, Object> policySnapshot() {
@@ -55,8 +56,9 @@ class DatabaseToolDbcTest {
         }
 
         @Override
-        public Resolved resolve(String agentCode, String token, String userName, String peerIp) {
+        public Resolved resolve(String agentCode, String token, String userToken, String peerIp) {
             renewCalls++;
+            lastUserToken = userToken;
             if (reject) {
                 throw new Rejected("凭据已被撤销");
             }
@@ -143,6 +145,20 @@ class DatabaseToolDbcTest {
         Map<String, Object> m = new HashMap<>();
         m.put(McpRequestFilter.CREDENTIAL, cred(t));
         m.put(McpRequestFilter.VIRTUAL_TOKEN, "vt");
+        m.put(McpRequestFilter.PEER_IP, "1.1.1.1");
+        m.put(McpRequestFilter.REQUEST_ID, new AtomicReference<String>());
+        return McpTransportContext.create(m);
+    }
+
+    /** 固定资源模式带 X-User-Token 的请求上下文: 凭据里带 Token 反查的可信用户 */
+    private static McpTransportContext namedCtx(long userId, ConsoleClient.DbcTicket t, String userToken) {
+        Map<String, Object> m = new HashMap<>();
+        m.put(McpRequestFilter.CREDENTIAL, new ConsoleClient.Resolved(7, 9, "DATABASE", "MYSQL", "10.0.0.1", 3306, "appdb",
+                "u", null, "agent-7", "user-" + userId, 1L, t, userId));
+        m.put(McpRequestFilter.VIRTUAL_TOKEN, "vt");
+        if (userToken != null) {
+            m.put(McpRequestFilter.FIXED_USER_TOKEN, userToken);
+        }
         m.put(McpRequestFilter.PEER_IP, "1.1.1.1");
         m.put(McpRequestFilter.REQUEST_ID, new AtomicReference<String>());
         return McpTransportContext.create(m);
@@ -423,6 +439,99 @@ class DatabaseToolDbcTest {
         }, om, console), null, new DbcClient("", om), console);
         r = unconfigured.db_create_connection(null, fixedCtx(ticket("t1", 300_000)));
         assertEquals("未配置 dbc.base-url, 数据库工具不可用", r.get("error"));
+    }
+
+    /** 固定资源连接按用户隔离: 匿名↔实名双向不可见, 实名之间不可见, 匿名之间仍共享 */
+    @Test
+    void fixedConnectionsIsolatedByTrustedUser() {
+        McpTransportContext anon = fixedCtx(ticket("t", 300_000));
+        McpTransportContext alice = namedCtx(5, ticket("t", 300_000), "ut-5");
+        McpTransportContext bob = namedCtx(6, ticket("t", 300_000), "ut-6");
+        String anonId = connect(anon);
+        String aliceId = connect(alice);
+
+        assertEquals(List.of(anonId), tool.db_list_connections(fixedCtx(ticket("t", 300_000))).get("connections"));
+        assertEquals(List.of(aliceId), tool.db_list_connections(namedCtx(5, ticket("t", 300_000), "ut-5")).get("connections"));
+        assertEquals(List.of(), tool.db_list_connections(bob).get("connections"));
+
+        Map<String, Object> r = tool.db_execute(anonId, "select 1", null, alice, null);
+        assertEquals("Connection not found: " + anonId, r.get("error"));
+        r = tool.db_execute(aliceId, "select 1", null, anon, null);
+        assertEquals("Connection not found: " + aliceId, r.get("error"));
+        r = tool.db_execute(aliceId, "select 1", null, bob, null);
+        assertEquals("Connection not found: " + aliceId, r.get("error"));
+        assertTrue(dbc.of("parse").isEmpty());
+    }
+
+    /** 匿名缓存的撤权广播只关匿名连接, 同凭据的实名连接不受影响 */
+    @Test
+    void revocationBroadcastClosesOnlyAnonymousConnections() throws Exception {
+        McpTransportContext anon = fixedCtx(ticket("t", 300_000));
+        McpTransportContext bob = namedCtx(6, ticket("t", 300_000), "ut-6");
+        connect(anon);
+        String bobId = connect(bob);
+
+        tool.revokeCredential(7, 9);
+
+        awaitClose();
+        assertEquals(List.of(), tool.db_list_connections(anon).get("connections"));
+        assertEquals(List.of(bobId), tool.db_list_connections(bob).get("connections"));
+    }
+
+    /** 实名连接续签带上 X-User-Token; 匿名续签不带 */
+    @Test
+    void namedRenewalCarriesUserToken() {
+        McpTransportContext ctx = namedCtx(5, ticket("old", 10_000), "ut-5");
+        String id = connect(ctx);
+        console.renewed = cred(ticket("new", 300_000));
+        dbc.reply("parse", parseOk("SELECT", "[\"appdb.t\"]"));
+        dbc.reply("execute", "{\"ok\":true,\"data\":{\"headers\":[\"a\"],\"rows\":[],\"truncated\":false}}");
+
+        Map<String, Object> r = tool.db_execute(id, "select a from t", null, ctx, null);
+
+        assertEquals(true, r.get("success"), String.valueOf(r));
+        assertEquals("ut-5", console.lastUserToken);
+        assertEquals("user-5", lastEvent().get("userName"));
+    }
+
+    /** 实名请求上下文取不到 Token 时续签直接拒, 不回落成匿名续签 */
+    @Test
+    void namedRenewalWithoutTokenRejected() throws Exception {
+        String id = connect(namedCtx(5, ticket("old", 10_000), "ut-5"));
+
+        Map<String, Object> r = tool.db_execute(id, "select 1", null, namedCtx(5, ticket("old", 10_000), null), null);
+
+        assertEquals(false, r.get("success"));
+        assertEquals("AUTH", lastEvent().get("denySource"));
+        assertEquals(0, console.renewCalls);
+        assertTrue(dbc.of("parse").isEmpty());
+    }
+
+    /** 等待后复检: 实名连接实时 resolve, 被拒不放行; 匿名连接不回控制台直接放行 */
+    @Test
+    void checkAfterWaitRechecksNamedOnly() {
+        McpTransportContext alice = namedCtx(5, ticket("t", 300_000), "ut-5");
+        Conn.ConnMeta named = Conn.ConnMeta.ofCredential(McpRequestFilter.credential(alice), "r");
+        McpTransportContext anon = fixedCtx(ticket("t", 300_000));
+        Conn.ConnMeta anonymous = Conn.ConnMeta.ofCredential(McpRequestFilter.credential(anon), "r");
+
+        console.reject = true;
+        assertEquals(ToolAuth.Verdict.ALLOW, ToolAuth.checkAfterWait(anon, anonymous).verdict());
+        assertEquals(0, console.renewCalls);
+        ToolAuth.Check c = ToolAuth.checkAfterWait(alice, named);
+        assertEquals(ToolAuth.Verdict.DENY, c.verdict());
+        assertEquals("凭据已被撤销", c.reason());
+        assertEquals("ut-5", console.lastUserToken);
+
+        console.reject = false;
+        assertEquals(ToolAuth.Verdict.ALLOW, ToolAuth.checkAfterWait(alice, named).verdict());
+        // 上下文丢了 Token: 拒绝, 不回落
+        assertEquals(ToolAuth.Verdict.DENY,
+                ToolAuth.checkAfterWait(namedCtx(5, ticket("t", 300_000), null), named).verdict());
+        // 进入等待前的入口校验已实时做过, check() 本身仍不回控制台
+        int calls = console.renewCalls;
+        assertEquals(ToolAuth.Verdict.ALLOW, ToolAuth.check(alice, named).verdict());
+        assertEquals(calls, console.renewCalls);
     }
 
     /** 撤权关闭是异步通知 DBC 的 */

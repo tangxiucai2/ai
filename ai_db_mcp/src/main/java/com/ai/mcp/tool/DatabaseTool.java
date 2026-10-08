@@ -237,7 +237,11 @@ public class DatabaseTool {
         return conn.handle().ticket();
     }
 
-    /** 按连接的模式回控制台换新票据: 固定资源模式走 resolve (快到期时绕过缓存), 用户模式走 resolve-credential */
+    /**
+     * 按连接的模式回控制台换新票据: 固定资源模式走 resolve (匿名快到期时绕过缓存, 实名本就不缓存), 用户模式走 resolve-credential
+     * <p>
+     * 固定资源实名请求必须带着 X-User-Token 续签, 取不到就拒, 不能回落成匿名续签拿到无操作人的票据
+     */
     private ConsoleClient.Resolved renew(McpTransportContext ctx, Conn.ConnMeta meta) throws Exception {
         String peerIp = McpRequestFilter.peerIp(ctx);
         if (Conn.MODE_USER.equals(meta.authMode())) {
@@ -253,7 +257,11 @@ public class DatabaseTool {
         if (cred == null || token == null) {
             return null;
         }
-        return console.resolve(cred.agentCode(), token, cred.userName(), peerIp);
+        String userToken = McpRequestFilter.fixedUserToken(ctx);
+        if (cred.userId() != null && userToken == null) {
+            throw new ConsoleClient.Rejected("用户身份缺失, 无法续签数据库票据");
+        }
+        return console.resolve(cred.agentCode(), token, userToken, peerIp);
     }
 
     /** 撤权/关闭: 以原子 remove 的返回值决定谁负责通知 DBC, 与 sweep/并发关闭不会重复关 */
@@ -265,11 +273,17 @@ public class DatabaseTool {
         }
     }
 
-    /** 固定资源模式续签被拒: 只关同一智能体、同一凭据、固定资源模式建的连接 */
-    private void revokeCredential(long agentId, long credentialId) {
+    /**
+     * 固定资源模式匿名缓存被拒: 只关同一智能体、同一凭据、固定资源模式建的匿名连接
+     * <p>
+     * 广播只来自匿名路径 (实名不缓存), 匿名被拒不代表同凭据的实名用户也被拒 (如范围由「全部」收紧到指定用户);
+     * 凭据整体失效时实名连接会在下一次请求入口被拒, 空闲的交给 IdleReaper 回收
+     */
+    void revokeCredential(long agentId, long credentialId) {
         for (Map.Entry<String, Conn<DbcConn>> e : connections.entrySet()) {
             Conn.ConnMeta m = e.getValue().meta();
-            if (Conn.MODE_CREDENTIAL.equals(m.authMode()) && m.agentId() == agentId && m.credentialId() == credentialId) {
+            if (Conn.MODE_CREDENTIAL.equals(m.authMode()) && m.agentId() == agentId && m.credentialId() == credentialId
+                    && m.userId() == null) {
                 revoke(e.getKey());
             }
         }
@@ -487,7 +501,7 @@ public class DatabaseTool {
     /**
      * 策略判定 → 拒绝原因; 通过返回 null
      * <p>
-     * 等过人工确认/审批的判定要再校验一次授权 (与 SshTool 同): 用户模式回控制台重校验, 被撤归 AUTH;
+     * 等过人工确认/审批的判定要再校验一次授权 (与 SshTool 同): 用户模式与固定资源实名连接回控制台重校验, 被撤归 AUTH;
      * 复检时控制台不可达或句柄已失效是故障, 来源为 null 按失败记
      */
     private Deny policyDeny(PolicyDecider.Decision decision, String connectionId, McpTransportContext ctx) {
@@ -498,7 +512,7 @@ public class DatabaseTool {
         }
         if (decision.confirmWaited()) {
             Conn<DbcConn> conn = reaper.peek(connectionId);
-            ToolAuth.Check c = conn == null || !conn.meta().accessibleBy(ctx) ? null : ToolAuth.check(ctx, conn.meta());
+            ToolAuth.Check c = conn == null || !conn.meta().accessibleBy(ctx) ? null : ToolAuth.checkAfterWait(ctx, conn.meta());
             if (c == null || c.verdict() != ToolAuth.Verdict.ALLOW) {
                 if (c != null && c.verdict() == ToolAuth.Verdict.DENY) {
                     revoke(connectionId);

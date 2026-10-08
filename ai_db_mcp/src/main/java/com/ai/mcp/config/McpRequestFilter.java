@@ -37,6 +37,12 @@ public class McpRequestFilter implements Filter {
     /** 用户自选模式的原始用户 Token, 供工具层换取凭据 */
     public static final String USER_TOKEN = "soag.userToken";
 
+    /**
+     * 固定资源模式的原始用户 Token (X-User-Token): 续签与确认等待后的实时复检要带它回控制台.
+     * 独立于 USER_TOKEN —— 写了 USER_TOKEN/USER_IDENTITY 就会被工具层当成用户自选模式 (如放开 list_credentials)
+     */
+    public static final String FIXED_USER_TOKEN = "soag.fixedUserToken";
+
     /** 用户自选模式本次请求的在途凭据集合: 工具层 begin 后写入, Filter 的 finally 统一 end */
     public static final String IN_FLIGHT = "soag.inFlight";
 
@@ -96,7 +102,7 @@ public class McpRequestFilter implements Filter {
         }
         HttpServletResponse resp = (HttpServletResponse) response;
         // fail-closed: 控制台未确认启用 (未注册/被禁用/密钥重置/已删除) 一律 503
-        // 审计用: 鉴权失败也记录发起方声称的身份
+        // 发起方自报的身份: 不可信, 鉴权失败时只作排障文本拼进原因 (见 deny); 身份可信后被覆盖或置空
         String agentCode = param(req, "X-Agent-Id", "agentId");
         String userName = param(req, "X-User-Name", "userName");
         String userId = param(req, "X-User-Id", "userId");
@@ -141,10 +147,11 @@ public class McpRequestFilter implements Filter {
             return;
         }
         // 智能体身份: Header 优先, Query 兜底 (客户端不支持自定义头的场景)
-        // 两种模式并存: 带虚拟凭据走固定资源模式 (老路径, 逐字节不变); 只带用户 Token 走用户自选模式.
-        // 两个都带时以虚拟凭据优先 —— 更具体的胜出; 也避免 URL 里残留的 token 把模式意外切走
+        // 两种模式并存: 带虚拟凭据走固定资源模式; 只带用户 Token 走用户自选模式.
+        // 两个都带时以虚拟凭据优先 —— 更具体的胜出; 也避免 URL 里残留的 token 把模式意外切走.
+        // 固定资源模式下用户 Token 只表明用户身份 (由控制台反查), 资源仍由虚拟凭据锁定
         String token = param(req, "X-Virtual-Token", "token");
-        String userToken = token != null ? null : param(req, "X-User-Token", "userToken");
+        String userToken = param(req, "X-User-Token", "userToken");
         if (agentCode == null || (token == null && userToken == null)) {
             deny(resp, HttpServletResponse.SC_UNAUTHORIZED, "缺少智能体标识或凭据", agentCode, userName, srcIp, userId);
             return;
@@ -153,7 +160,7 @@ public class McpRequestFilter implements Filter {
         ConsoleClient.ResolvedUser identity = null;
         try {
             if (token != null) {
-                credential = console.resolve(agentCode, token, userName, peerIp);
+                credential = console.resolve(agentCode, token, userToken, peerIp);
             } else {
                 identity = console.resolveUser(agentCode, userToken, peerIp);
             }
@@ -168,6 +175,12 @@ public class McpRequestFilter implements Filter {
         if (credential != null) {
             req.setAttribute(CREDENTIAL, credential);
             req.setAttribute(VIRTUAL_TOKEN, token);
+            if (userToken != null) {
+                req.setAttribute(FIXED_USER_TOKEN, userToken);
+            }
+            // 用户字段只认控制台按 Token 反查的结果, 不带 Token 两者置空: 自报值不进审计/策略上报/审批
+            userName = credential.userName();
+            userId = credential.userId() == null ? null : String.valueOf(credential.userId());
         } else {
             req.setAttribute(USER_IDENTITY, identity);
             req.setAttribute(USER_TOKEN, userToken);
@@ -218,8 +231,13 @@ public class McpRequestFilter implements Filter {
         return v == null || v.isBlank() ? null : v.trim();
     }
 
+    /**
+     * 拒绝时身份尚未可信: 正式审计的操作人置空, 自报值只作标注过的排障文本拼进原因, 不参与归因; 回给客户端的仍是原文
+     */
     private void deny(HttpServletResponse resp, int status, String msg, String agent, String user, String srcIp, String userId) throws IOException {
-        audit.denied(agent, user, msg, srcIp, userId);
+        String claimed = user != null ? (userId == null ? user : user + ", userId=" + userId)
+                : userId == null ? null : "userId=" + userId;
+        audit.denied(agent, null, claimed == null ? msg : msg + "（客户端自报: " + claimed + "）", srcIp, null);
         reject(resp, status, msg);
     }
 
@@ -258,6 +276,11 @@ public class McpRequestFilter implements Filter {
     /** 工具方法从 McpTransportContext 取 TCP 对端地址 (透传控制台做智能体 IP 范围校验) */
     public static String peerIp(McpTransportContext ctx) {
         return ctx == null ? null : (String) ctx.get(PEER_IP);
+    }
+
+    /** 工具方法从 McpTransportContext 取固定资源模式的原始用户 Token (续签与等待后复检用; 匿名固定资源为 null) */
+    public static String fixedUserToken(McpTransportContext ctx) {
+        return ctx == null ? null : (String) ctx.get(FIXED_USER_TOKEN);
     }
 
     /** 工具方法从 McpTransportContext 取原始用户 Token (换取凭据用) */

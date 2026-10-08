@@ -88,7 +88,7 @@ public class McpTransportConfig {
      */
     public static McpTransportContext extract(HttpServletRequest req) {
         Map<String, Object> ctx = new HashMap<>();
-        for (String k : new String[]{McpRequestFilter.CREDENTIAL, McpRequestFilter.VIRTUAL_TOKEN, McpRequestFilter.USER_IDENTITY,
+        for (String k : new String[]{McpRequestFilter.CREDENTIAL, McpRequestFilter.VIRTUAL_TOKEN, McpRequestFilter.FIXED_USER_TOKEN, McpRequestFilter.USER_IDENTITY,
                 McpRequestFilter.USER_TOKEN, McpRequestFilter.IN_FLIGHT, McpRequestFilter.RESOLVED, McpRequestFilter.DENY_REASON,
                 McpRequestFilter.SRC_IP, McpRequestFilter.PEER_IP, McpRequestFilter.USER_ID, McpRequestFilter.REQUEST_ID}) {
             Object v = req.getAttribute(k);

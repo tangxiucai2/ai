@@ -56,7 +56,8 @@ public class ToolAuth {
      * 同 {@link #verdict}, 另带本次原因
      * <p>
      * 单连接操作的报错必须取本次原因: 请求级 DENY_REASON 是首写语义, 同一请求里先被拒再遇故障时会串成前一次的原因.
-     * 固定资源模式不重校验: 身份本就不可信, 加了既改变存量行为又白付性能
+     * 固定资源模式这里不重校验: 匿名本就无身份可校; 带 Token 的请求在 Filter 入口已实时校验过 (不走缓存),
+     * 只有人工确认等待之后才需要再校一次, 见 {@link #checkAfterWait}
      */
     static Check check(McpTransportContext ctx, Conn.ConnMeta meta) {
         if (!Conn.MODE_USER.equals(meta.authMode())) {
@@ -81,6 +82,34 @@ public class ToolAuth {
             // 控制台不可达: 拒绝而非放行, 否则撤权在故障窗口内失效
             log.warn("重校验控制台不可达 credentialId={}: {}", meta.credentialId(), e.toString());
             denied(ctx, meta, CONSOLE_UNAVAILABLE);
+            return new Check(Verdict.UNAVAILABLE, CONSOLE_UNAVAILABLE);
+        }
+    }
+
+    /**
+     * 人工确认/审批等待之后的复检: 等待可能长达数分钟, 期间 Token 可能被停用
+     * <p>
+     * 固定资源实名连接用请求带来的 X-User-Token 实时回控制台 resolve (Token 路径不缓存), 被拒不执行;
+     * 匿名固定资源保持原样直接放行; 用户自选模式同 {@link #check}
+     */
+    static Check checkAfterWait(McpTransportContext ctx, Conn.ConnMeta meta) {
+        if (!Conn.MODE_CREDENTIAL.equals(meta.authMode()) || meta.userId() == null) {
+            return check(ctx, meta);
+        }
+        ConsoleClient.Resolved cred = McpRequestFilter.credential(ctx);
+        String token = McpRequestFilter.virtualToken(ctx);
+        String userToken = McpRequestFilter.fixedUserToken(ctx);
+        if (cred == null || token == null || userToken == null || console == null) {
+            return new Check(Verdict.DENY, null);
+        }
+        try {
+            console.resolve(cred.agentCode(), token, userToken, McpRequestFilter.peerIp(ctx));
+            return new Check(Verdict.ALLOW, null);
+        } catch (ConsoleClient.Rejected e) {
+            log.info("等待后复检用户身份已失效 credentialId={}: {}", meta.credentialId(), e.getMessage());
+            return new Check(Verdict.DENY, e.getMessage());
+        } catch (Exception e) {
+            log.warn("等待后复检控制台不可达 credentialId={}: {}", meta.credentialId(), e.toString());
             return new Check(Verdict.UNAVAILABLE, CONSOLE_UNAVAILABLE);
         }
     }

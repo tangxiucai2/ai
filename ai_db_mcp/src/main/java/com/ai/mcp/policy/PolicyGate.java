@@ -189,8 +189,10 @@ public class PolicyGate {
      * kind() 可能是 APPROVAL 或 BOTH, 本方法内部不读 kind(), 只读 policyLabel/policyRevision/policyType 三个字段
      */
     private Decision approval(McpTransportContext ctx, Decision decision, String tool, Subject subject, ConsoleClient.Resolved cred) {
+        // 审批指纹按用户隔离: 用户自选取 resolve-user 的身份, 固定资源取 Token 反查的 userId (匿名为 null)
         ConsoleClient.ResolvedUser identity = McpRequestFilter.userIdentity(ctx);
-        Long userId = identity != null ? identity.userId() : null;
+        // identity.userId() 是 long, 必须先装箱: 否则三元表达式整体拆箱, 匿名 (null) 时 NPE
+        Long userId = identity != null ? Long.valueOf(identity.userId()) : cred.userId();
         String bareRequestId = McpRequestFilter.requestId(ctx);
         String fullRequestId = console.nodeId() + "-" + bareRequestId;
         String resource = cred.address() == null || cred.address().isBlank() ? "cred#" + cred.credentialId()

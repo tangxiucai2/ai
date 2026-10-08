@@ -106,7 +106,7 @@ public class ConsoleClient {
     private volatile boolean policyReported;
     private volatile String lastPolicyVersion;
 
-    // 身份解析缓存 key = agentCode\ntoken\nuserName\npeerIp; 访问序 LinkedHashMap, 超 1000 条淘汰最久未用; 拒绝不缓存
+    // 身份解析缓存 (仅匿名路径) key = agentCode\ntoken\npeerIp; 访问序 LinkedHashMap, 超 1000 条淘汰最久未用; 拒绝不缓存
     private static final int RESOLVE_CACHE_MAX = 1000;
     private final LinkedHashMap<String, CachedResolved> resolveCache = new LinkedHashMap<>(64, 0.75f, true) {
         @Override
@@ -121,10 +121,19 @@ public class ConsoleClient {
      * @param dbType 资源主类型 (primaryType 推导), 同时就是访问控制策略的 hostType 口径
      * @param hostId 目标资源 id, 策略按它定范围; 旧版控制台不下发时为 null → 不按策略放行
      * @param dbc    DBC 票据 (仅 DATABASE 类; 控制台不再下发数据库密码), 其余类别或旧版控制台为 null
+     * @param userId 固定资源模式 X-User-Token 反查出的可信用户 id; 匿名固定资源与其余场景为 null
      */
     public record Resolved(long agentId, long credentialId, String category, String dbType, String address,
                            Integer port, String dbName, String username, String password,
-                           String agentCode, String userName, Long hostId, DbcTicket dbc) {
+                           String agentCode, String userName, Long hostId, DbcTicket dbc, Long userId) {
+
+        /** 无固定资源用户身份 (用户自选模式 / 匿名固定资源 / 拒绝留痕) */
+        public Resolved(long agentId, long credentialId, String category, String dbType, String address,
+                        Integer port, String dbName, String username, String password,
+                        String agentCode, String userName, Long hostId, DbcTicket dbc) {
+            this(agentId, credentialId, category, dbType, address, port, dbName, username, password,
+                    agentCode, userName, hostId, dbc, null);
+        }
 
         /** 不带 DBC 票据 (HOST 类 / 拒绝留痕等只补身份与资源的场景) */
         public Resolved(long agentId, long credentialId, String category, String dbType, String address,
@@ -157,7 +166,11 @@ public class ConsoleClient {
         }
     }
 
-    /** 固定资源模式续签被控制台明确拒绝 (撤权/过期/禁用): 数据库工具据此主动关闭该凭据的连接 */
+    /**
+     * 固定资源模式续签被控制台明确拒绝 (撤权/过期/禁用): 数据库工具据此主动关闭该凭据的匿名连接
+     * <p>
+     * 只有匿名路径有缓存才会触发; 实名连接由各自请求入口的实时校验拦截, 不能被别人的失效连带关掉
+     */
     public interface CredentialRevoked {
         void onRevoked(long agentId, long credentialId);
     }
@@ -611,28 +624,37 @@ public class ConsoleClient {
     }
 
     /**
-     * 虚拟凭据 → 真实连接信息: 缓存命中直接返回, 未命中调控制台 opt/resolve (ttl 由控制台下发)
+     * 虚拟凭据 → 真实连接信息: 匿名路径缓存命中直接返回, 未命中调控制台 opt/resolve (ttl 由控制台下发)
+     * <p>
+     * 带 userToken (固定资源模式的用户身份) 时不读不写缓存, 每次实时校验: 缓存会让停用/撤权的 Token 仍有 TTL 窗口可用,
+     * 与用户自选模式 resolve-user 不缓存同口径; 也因此没有缓存条目, 其拒绝不会触发凭据级撤权广播去关别人的连接
+     * <p>
+     * 用户名/用户 id 只取控制台响应, 客户端自报的 X-User-Name 不再发给控制台, 也不进入 Resolved
      *
-     * @throws Rejected  控制台拒绝 (原因为中文, 直接回给客户端)
+     * @param userToken 固定资源模式的 X-User-Token, 不带为 null (匿名)
+     * @throws Rejected  控制台拒绝 (原因为中文, 直接回给客户端); Token 路径响应缺用户身份也按拒绝处理
      * @throws Exception 控制台不可达
      */
     @SuppressWarnings("unchecked")
-    public Resolved resolve(String agentCode, String token, String userName, String peerIp) throws Exception {
+    public Resolved resolve(String agentCode, String token, String userToken, String peerIp) throws Exception {
+        boolean anonymous = userToken == null;
         // 带上对端地址: IP 范围校验结果随来源地址变化, 不能让 A 地址的放行结果被 B 地址命中
-        String key = agentCode + "\n" + token + "\n" + (userName == null ? "" : userName) + "\n" + peerIp;
+        String key = agentCode + "\n" + token + "\n" + peerIp;
         long now = System.currentTimeMillis();
-        synchronized (resolveCache) {
-            CachedResolved hit = resolveCache.get(key);
-            // 数据库票据快到期时绕过缓存续签: 缓存 ttl 由控制台下发, 可能长过票据剩余寿命
-            if (hit != null && hit.expireAt() > now && (hit.value().dbc() == null || !hit.value().dbc().expiring(now))) {
-                return hit.value();
+        if (anonymous) {
+            synchronized (resolveCache) {
+                CachedResolved hit = resolveCache.get(key);
+                // 数据库票据快到期时绕过缓存续签: 缓存 ttl 由控制台下发, 可能长过票据剩余寿命
+                if (hit != null && hit.expireAt() > now && (hit.value().dbc() == null || !hit.value().dbc().expiring(now))) {
+                    return hit.value();
+                }
             }
         }
         Map<String, Object> body = new java.util.HashMap<>();
         body.put("agentCode", agentCode);
         body.put("token", token);
-        if (userName != null) {
-            body.put("userName", userName);
+        if (!anonymous) {
+            body.put("userToken", userToken);
         }
         if (peerIp != null) {
             body.put("srcIp", peerIp);
@@ -642,10 +664,12 @@ public class ConsoleClient {
             // 仅 400/401/403 是控制台明确拒绝 (回 403); 500/空响应属控制台故障, 抛出走 503
             int code = resp != null && resp.get("code") instanceof Number ? ((Number) resp.get("code")).intValue() : -1;
             if (code == 400 || code == 401 || code == 403) {
-                // 之前放行过的凭据这次被拒 = 撤权/过期/禁用: 丢掉旧缓存并通知数据库工具关掉已有连接
-                CachedResolved stale;
-                synchronized (resolveCache) {
-                    stale = resolveCache.remove(key);
+                // 之前放行过的凭据这次被拒 = 撤权/过期/禁用: 丢掉旧缓存并通知数据库工具关掉已有的匿名连接
+                CachedResolved stale = null;
+                if (anonymous) {
+                    synchronized (resolveCache) {
+                        stale = resolveCache.remove(key);
+                    }
                 }
                 if (stale != null) {
                     for (CredentialRevoked listener : credentialRevoked) {
@@ -658,6 +682,16 @@ public class ConsoleClient {
             throw new IllegalStateException("控制台响应异常 code=" + code);
         }
         Map<String, Object> d = (Map<String, Object>) resp.get("data");
+        Long userId = null;
+        String userName = null;
+        if (!anonymous) {
+            // 旧控制台不认 userToken 会照常放行但不回身份: 缺任一项即拒, 不能静默降级成匿名
+            if (!(d.get("userId") instanceof Number id) || !(d.get("userName") instanceof String name) || name.isBlank()) {
+                throw new Rejected("控制台版本不匹配: 未返回用户身份, 请升级控制台");
+            }
+            userId = id.longValue();
+            userName = name;
+        }
         Resolved r = new Resolved(
                 ((Number) d.get("agentId")).longValue(),
                 ((Number) d.get("credentialId")).longValue(),
@@ -671,10 +705,13 @@ public class ConsoleClient {
                 agentCode,
                 userName,
                 d.get("hostId") == null ? null : ((Number) d.get("hostId")).longValue(),
-                dbcOf(d));
-        long ttl = d.get("ttlSeconds") == null ? 60 : ((Number) d.get("ttlSeconds")).longValue();
-        synchronized (resolveCache) {
-            resolveCache.put(key, new CachedResolved(r, now + ttl * 1000));
+                dbcOf(d),
+                userId);
+        if (anonymous) {
+            long ttl = d.get("ttlSeconds") == null ? 60 : ((Number) d.get("ttlSeconds")).longValue();
+            synchronized (resolveCache) {
+                resolveCache.put(key, new CachedResolved(r, now + ttl * 1000));
+            }
         }
         return r;
     }
