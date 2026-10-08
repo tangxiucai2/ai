@@ -240,17 +240,25 @@ public class ConsoleClient {
     }
 
     private void tick() {
+        scheduler.schedule(this::tick, runOnce(), TimeUnit.SECONDS);
+    }
+
+    /** 一轮注册/心跳, 返回下轮间隔(秒); 包级可见仅供同包单测逐轮驱动 */
+    long runOnce() {
         long next = RETRY_INTERVAL_S;
         try {
-            if (secret == null) {
-                if (unsavedSecret == null) {
-                    register();
-                } else {
-                    persistSecret();
-                }
+            // 落盘补偿放最前: 首次注册与重新注册共用, 不受 secret!=null 遮蔽
+            if (unsavedSecret != null) {
+                persistSecret();
+            } else if (secret == null) {
+                register();
             }
             if (secret != null) {
-                report();
+                // 心跳被拒(body 403)同轮匿名注册试探一次: 成功即用新密钥立即再发一次签名心跳,
+                // 由它决定 enabled / authConf / 策略
+                if (report() == ReportResult.REJECTED_403 && reregister()) {
+                    report();
+                }
                 next = REPORT_INTERVAL_S;
             }
         } catch (HttpClientErrorException.Unauthorized | HttpClientErrorException.Forbidden e) {
@@ -263,17 +271,14 @@ public class ConsoleClient {
             nodeEvent(SRC_CONSOLE, AuditLog.FAILED, "控制台不可达: " + e);
             log.warn("ConsoleClient 控制台不可达: {}", e.toString());
         }
-        scheduler.schedule(this::tick, next, TimeUnit.SECONDS);
+        return next;
     }
 
     @SuppressWarnings("unchecked")
     private void register() throws Exception {
-        Map<String, Object> resp = http.post().uri(consoleUrl + "/agent/gateway/opt/register")
-                .contentType(MediaType.APPLICATION_JSON)
-                .body(Map.of("code", nodeId))
-                .retrieve().body(Map.class);
+        Map<String, Object> resp = sendRegister();
         if (!isOk(resp)) {
-            // 节点未登记/已禁用/控制台已下发过密钥(本地文件丢失需控制台重置密钥)
+            // 节点未登记/已禁用/控制台已下发过密钥(本地文件丢失需控制台重新注册)
             enabled = false;
             nodeEvent(SRC_CONSOLE, AuditLog.DENIED, "注册被拒: " + (resp == null ? null : resp.get("msg")));
             log.warn("ConsoleClient 注册被拒: {}", resp == null ? null : resp.get("msg"));
@@ -284,6 +289,35 @@ public class ConsoleClient {
         unsavedSecret = (String) data.get("authSecret");
         unsavedData = data;
         persistSecret();
+    }
+
+    /**
+     * 心跳被拒后的匿名注册试探: 控制台点了「重新注册」(密钥已清空) 才会下发新密钥
+     *
+     * @return 新密钥已落盘并切换
+     */
+    private boolean reregister() throws Exception {
+        Map<String, Object> resp = sendRegister();
+        // 失败静默: 禁用/已删除时每轮都会走到这里, 再写日志会与「心跳被拒」交替刷日志环
+        if (!isOk(resp) || !(resp.get("data") instanceof Map<?, ?> data)
+                || !(data.get("authSecret") instanceof String s) || s.isBlank()) {
+            return false;
+        }
+        unsavedSecret = s;
+        // null 标记重新注册模式: 注册响应未签名, 不应用其 status/authType/authToken; 补偿落盘沿用此模式
+        unsavedData = null;
+        persistSecret();
+        nodeEvent(SRC_CONSOLE, AuditLog.SUCCESS, "控制台已重置密钥, 自动重新注册成功");
+        return true;
+    }
+
+    /** 匿名注册 (不带签名头); 包级可见仅供测试覆写截获请求 */
+    @SuppressWarnings("unchecked")
+    Map<String, Object> sendRegister() {
+        return http.post().uri(consoleUrl + "/agent/gateway/opt/register")
+                .contentType(MediaType.APPLICATION_JSON)
+                .body(Map.of("code", nodeId))
+                .retrieve().body(Map.class);
     }
 
     private void persistSecret() throws Exception {
@@ -307,14 +341,22 @@ public class ConsoleClient {
         if (tls != null) {
             tls.rebase();
         }
+        if (data == null) {
+            // 重新注册: 只切换密钥, enabled 与认证字段等新密钥签名心跳决定, 期间 /mcp 维持 503
+            log.info("ConsoleClient 重新注册成功, 密钥已保存 {}", secretFile);
+            return;
+        }
         applyAuth(data);
         enabled = "1".equals(data.get("status"));
         nodeEvent(SRC_CONSOLE, AuditLog.SUCCESS, "注册成功, 密钥已保存");
         log.info("ConsoleClient 注册成功, 密钥已保存 {}", secretFile);
     }
 
+    /** 心跳结果: FAILED = body 非 200 且非 403 / data 缺失; 网络异常与 data 结构错误仍抛出 */
+    enum ReportResult { OK, REJECTED_403, FAILED }
+
     @SuppressWarnings("unchecked")
-    private void report() throws Exception {
+    private ReportResult report() throws Exception {
         Map<String, Object> body = new LinkedHashMap<>();
         body.put("cpu", cpuPercent());
         body.put("mem", memPercent());
@@ -346,7 +388,7 @@ public class ConsoleClient {
             }
             enabled = false;
             failPolicy();
-            return;
+            return resp != null && Integer.valueOf(403).equals(resp.get("code")) ? ReportResult.REJECTED_403 : ReportResult.FAILED;
         }
         try {
             Map<String, Object> data = (Map<String, Object>) resp.get("data");
@@ -364,6 +406,7 @@ public class ConsoleClient {
             log.info("ConsoleClient 心跳正常, /mcp 放行");
         }
         enabled = true;
+        return ReportResult.OK;
     }
 
     /** 策略快照版本下发回调 */
