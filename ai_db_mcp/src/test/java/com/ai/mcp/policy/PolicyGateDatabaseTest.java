@@ -162,7 +162,7 @@ class PolicyGateDatabaseTest {
         setUp(policy(1, PolicyStore.TYPE_WHITELIST, "MYSQL", "APPROVAL", "UPDATE"));
         Map<String, Object> scope = new LinkedHashMap<>(policy(2, PolicyStore.TYPE_DATA_SCOPE, "MYSQL", "NONE", "X"));
         scope.put("ops", List.of());
-        scope.put("tables", List.of(Map.of("tableName", "user", "matchType", "EXACT")));
+        scope.put("tables", List.of(Map.of("tableName", "user", "matchType", "EXACT", "ops", List.of("UPDATE"))));
         console.duringGate = () -> load("v2", policy(1, PolicyStore.TYPE_WHITELIST, "MYSQL", "APPROVAL", "UPDATE"), scope);
         console.result = new ConsoleClient.ApprovalGateResult("ALLOW", 1L, "AP-1", null, null, null);
         PolicyDecider.Decision r = checkDb();

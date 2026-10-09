@@ -4,9 +4,11 @@ import com.ai.mcp.config.ConsoleClient;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import org.junit.jupiter.api.Test;
 
+import java.util.ArrayList;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
@@ -15,7 +17,7 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 
 /**
  * PolicyStore 接收 DATABASE 类策略 (字段口径以 SOAG AgentGatewayPolicySnapshotVO / getPolicySnapshot 为准):
- * DATA_SCOPE 的 tables:[{tableName, matchType}]、DATABASE 操作项只许 EXACT 十项
+ * DATA_SCOPE 的 tables:[{tableName, matchType, ops}]、DATABASE 操作项只许 EXACT 十项
  */
 class PolicyStoreDatabaseTest {
 
@@ -54,15 +56,66 @@ class PolicyStoreDatabaseTest {
         return p;
     }
 
+    private static Map<String, Object> table(String name, String matchType, Object ops) {
+        Map<String, Object> t = new LinkedHashMap<>();
+        t.put("tableName", name);
+        t.put("matchType", matchType);
+        if (ops != null) {
+            t.put("ops", ops);
+        }
+        return t;
+    }
+
     @Test
     void dataScopeTablesParsed() throws Exception {
         PolicyStore.Policy p = fetch(dataScope(List.of(
-                Map.of("tableName", "order_", "matchType", "PREFIX"),
-                Map.of("tableName", "sales.订单", "matchType", "EXACT"),
-                Map.of("tableName", "_log", "matchType", "SUFFIX")))).policies().get(0);
+                table("order_", "PREFIX", List.of("SELECT")),
+                table("sales.订单", "EXACT", List.of("SELECT", "DELETE")),
+                table("_log", "SUFFIX", List.of("INSERT"))))).policies().get(0);
         assertTrue(p.database());
-        assertEquals(List.of(new PolicyStore.Table("order_", "PREFIX"), new PolicyStore.Table("sales.订单", "EXACT"),
-                new PolicyStore.Table("_log", "SUFFIX")), p.tables());
+        assertFalse(p.rulesInvalid());
+        assertEquals(List.of(new PolicyStore.Table("order_", "PREFIX", Set.of("SELECT")),
+                new PolicyStore.Table("sales.订单", "EXACT", Set.of("SELECT", "DELETE")),
+                new PolicyStore.Table("_log", "SUFFIX", Set.of("INSERT"))), p.tables());
+    }
+
+    /** 小写 ops (同操作项 F10 口径) 大写化后接收 */
+    @Test
+    void dataScopeLowercaseOpsNormalized() throws Exception {
+        PolicyStore.Policy p = fetch(dataScope(List.of(table("t", "EXACT", List.of("select", "Show"))))).policies().get(0);
+        assertFalse(p.rulesInvalid());
+        assertEquals(Set.of("SELECT", "SHOW"), p.tables().get(0).ops());
+    }
+
+    /** ops 缺失/空数组/不是数组/非文本/值域外: 只降级该策略为规则无效, 不让整次拉取失败 */
+    @Test
+    void dataScopeBadOpsDowngradesToRulesInvalid() throws Exception {
+        List<Object> bads = new ArrayList<>();
+        bads.add(null);
+        bads.add(List.of());
+        bads.add("SELECT");
+        bads.add(List.of(1));
+        bads.add(List.of("SELECT", "GRANT"));
+        for (Object ops : bads) {
+            PolicyStore.Policy p = fetch(dataScope(List.of(
+                    table("ok", "EXACT", List.of("SELECT")), table("t", "EXACT", ops)))).policies().get(0);
+            assertTrue(p.rulesInvalid(), "ops=" + ops);
+            assertEquals(List.of(), p.tables());
+        }
+    }
+
+    /** ops 坏行只影响所在策略: 同快照里的其它策略照常有效 */
+    @Test
+    void dataScopeBadOpsDoesNotAffectOtherPolicies() throws Exception {
+        Map<String, Object> bad = dataScope(List.of(table("t", "EXACT", null)));
+        Map<String, Object> good = dataScope(List.of(table("t", "EXACT", List.of("SELECT"))));
+        good.put("id", 2L);
+        FakeConsoleClient console = new FakeConsoleClient();
+        console.data = Map.of("version", "v1", "policies", List.of(bad, good));
+        List<PolicyStore.Policy> got = new PolicyStore(console, new ObjectMapper()).fetch("v1").policies();
+        assertTrue(got.get(0).rulesInvalid());
+        assertFalse(got.get(1).rulesInvalid());
+        assertEquals(Set.of("SELECT"), got.get(1).tables().get(0).ops());
     }
 
     @Test
@@ -73,13 +126,20 @@ class PolicyStoreDatabaseTest {
     @Test
     void dataScopeBadMatchTypeFails() {
         assertThrows(IllegalStateException.class,
-                () -> fetch(dataScope(List.of(Map.of("tableName", "t", "matchType", "REGEX")))));
+                () -> fetch(dataScope(List.of(table("t", "REGEX", List.of("SELECT"))))));
     }
 
     @Test
     void dataScopeBadTableNameFails() {
         assertThrows(IllegalStateException.class,
-                () -> fetch(dataScope(List.of(Map.of("tableName", "t;drop", "matchType", "EXACT")))));
+                () -> fetch(dataScope(List.of(table("t;drop", "EXACT", List.of("SELECT"))))));
+    }
+
+    /** 坏表名仍整次失败, 不因同策略另一项 ops 坏 (降级) 而被放过 —— 与项的先后顺序无关 */
+    @Test
+    void dataScopeBadTableNameFailsEvenWithBadOps() {
+        assertThrows(IllegalStateException.class,
+                () -> fetch(dataScope(List.of(table("t", "EXACT", null), table("t;drop", "EXACT", List.of("SELECT"))))));
     }
 
     /** 控制台对无效行下发 tables=[] + rulesInvalid=true: 正常接收, 由裁决侧按拒绝处理 */

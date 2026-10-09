@@ -14,6 +14,7 @@ import java.time.format.DateTimeFormatter;
 import java.time.format.ResolverStyle;
 import java.util.ArrayList;
 import java.util.LinkedHashSet;
+import java.util.Locale;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
@@ -43,7 +44,7 @@ public class PolicyStore {
     public static final String TYPE_BLACKLIST = "BLACKLIST";
     /** 频率限制: 网关不执行 (快照里也没有限额字段), 只当它不存在 */
     public static final String TYPE_RATE_LIMIT = "RATE_LIMIT";
-    /** 数据范围: 仅 DATABASE 类, 规则是表名清单 (tables), 不带 ops */
+    /** 数据范围: 仅 DATABASE 类, 规则是逐表授权 (tables, 每张表带允许的 ops), 策略级 ops 恒空 */
     public static final String TYPE_DATA_SCOPE = "DATA_SCOPE";
 
     /** HOST 类唯一的资源主类型; 其余 hostType 一律归 DATABASE 类 (控制台只下发这两类) */
@@ -94,10 +95,11 @@ public class PolicyStore {
 
     /**
      * 一条 DATA_SCOPE 表规则: 表名原值 (可为裸名或 {@code 库.表}) + 匹配方式 (EXACT/PREFIX/SUFFIX)
+     * + 该表允许的操作 (非空, 已大写, 均在 {@link #DB_OPS} 内)
      * <p>
      * 原值保留, 大小写规范化与补默认命名空间在裁决时按库类型做 (见 {@code PolicyDecider.tableHit})
      */
-    public record Table(String tableName, String matchType) {
+    public record Table(String tableName, String matchType, Set<String> ops) {
     }
 
     /**
@@ -306,7 +308,7 @@ public class PolicyStore {
                 // 大小写不敏感 —— 控制台落库前大写化, 但存量行可能仍是小写, 裁决侧同样按不敏感比较
                 if (!OP_MATCH_TYPES.contains(matchType) || !validOpValue(opValue, matchType)
                         || database && !("EXACT".equals(matchType)
-                        && DB_OPS.contains(opValue.toUpperCase(java.util.Locale.ROOT)))) {
+                        && DB_OPS.contains(opValue.toUpperCase(Locale.ROOT)))) {
                     if (!invalid) {
                         throw new IllegalStateException("策略快照条目的操作项无法解析 (matchType 未知或值域非法): " + p);
                     }
@@ -326,6 +328,13 @@ public class PolicyStore {
                 ops.add(new Op(opValue, matchType, pattern));
             }
             List<Table> tables = TYPE_DATA_SCOPE.equals(type) ? parseTables(p, invalid) : List.of();
+            if (tables == null) {
+                // 表规则的 ops 缺失/非法: 只把这一条策略降级为规则无效 (适用范围内一律拒绝),
+                // 不牵连整次拉取 —— 一条坏行不该让整个节点 HOST+DATABASE 全拒
+                log.warn("DATA_SCOPE 表规则 ops 缺失或非法, 策略按规则无效处理 id={}", p.path("id").asLong());
+                invalid = true;
+                tables = List.of();
+            }
             // rulesSummary 展示用可空 (规则无效时控制台本就不下发有意义的摘要), 不必牵连整次拉取失败
             String rulesSummary = p.path("rulesSummary").isTextual() ? p.path("rulesSummary").asText() : null;
             // actionTimeStart/End 保留**原值**(可能为 null): 非法的那些已由 actionTimeValid 标成 invalid,
@@ -347,8 +356,14 @@ public class PolicyStore {
 
     /**
      * DATA_SCOPE 表规则: 与 ops 同一套 fail-closed 口径 —— rulesInvalid=false 时 tables 缺失/不是数组/
-     * 某项读不出来/值域非法, 一律整次拉取失败 (静默丢一项等于把数据范围悄悄改宽或改窄);
+     * 某项 tableName/matchType 读不出来/值域非法, 一律整次拉取失败 (静默丢一项等于把数据范围悄悄改宽或改窄);
      * rulesInvalid=true 的策略整体按拒绝处理, 表规则内容不影响裁决, 读不出来的项直接跳过
+     * <p>
+     * 表规则的 ops 另走一套: 缺失/不是非空文本数组/有值不在 {@link #DB_OPS} 内 (大小写不敏感, 同操作项口径),
+     * 返回 null 交调用方把<b>该策略</b>降级为 rulesInvalid —— 不能当"不限操作" (变宽), 也不让整次拉取失败.
+     * tableName/matchType 的校验不受 ops 结果影响, 坏表名照旧整次失败
+     *
+     * @return 表规则列表; 某项 ops 缺失/非法 (且策略原本有效) 时返回 null
      */
     private static List<Table> parseTables(JsonNode p, boolean invalid) {
         JsonNode node = p.path("tables");
@@ -359,6 +374,7 @@ public class PolicyStore {
             return List.of();
         }
         List<Table> tables = new ArrayList<>();
+        boolean opsBad = false;
         for (JsonNode t : node) {
             JsonNode nameNode = t.path("tableName");
             JsonNode matchTypeNode = t.path("matchType");
@@ -370,9 +386,30 @@ public class PolicyStore {
                 }
                 continue;
             }
-            tables.add(new Table(nameNode.asText(), matchTypeNode.asText()));
+            Set<String> ops = parseTableOps(t.path("ops"));
+            if (ops == null) {
+                opsBad = true;
+                continue;
+            }
+            tables.add(new Table(nameNode.asText(), matchTypeNode.asText(), ops));
         }
-        return List.copyOf(tables);
+        return opsBad && !invalid ? null : List.copyOf(tables);
+    }
+
+    /** 表规则允许的操作: 非空文本数组, 大写后均在 {@link #DB_OPS} 内; 不满足返回 null */
+    private static Set<String> parseTableOps(JsonNode node) {
+        if (!node.isArray() || node.isEmpty()) {
+            return null;
+        }
+        Set<String> ops = new LinkedHashSet<>();
+        for (JsonNode o : node) {
+            String op = o.isTextual() ? o.asText().toUpperCase(Locale.ROOT) : null;
+            if (op == null || !DB_OPS.contains(op)) {
+                return null;
+            }
+            ops.add(op);
+        }
+        return Set.copyOf(ops);
     }
 
     /**

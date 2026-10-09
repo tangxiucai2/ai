@@ -86,13 +86,20 @@ class PolicyDeciderDatabaseTest {
         return list(id, PolicyStore.TYPE_BLACKLIST, mode, ops);
     }
 
-    /** DATA_SCOPE: 规则按 "表名:匹配方式" 传, 匹配方式缺省 EXACT */
+    /** 十项操作全给: 只测表名维度的用例用它, 等价于改造前「只管表不管操作」 */
+    private static final List<String> ALL_OPS =
+            List.of("SELECT", "INSERT", "UPDATE", "DELETE", "DROP", "TRUNCATE", "ALTER", "CREATE", "SHOW", "DESCRIBE");
+
+    /**
+     * DATA_SCOPE: 规则按 "表名:匹配方式:操作1|操作2" 传, 匹配方式缺省 EXACT, 操作缺省十项全给
+     */
     private static Map<String, Object> scope(long id, String hostType, String... rules) {
         Map<String, Object> p = base(id, PolicyStore.TYPE_DATA_SCOPE, hostType, "NONE");
         List<Object> tables = new ArrayList<>();
         for (String r : rules) {
             String[] kv = r.split(":");
-            tables.add(Map.of("tableName", kv[0], "matchType", kv.length > 1 ? kv[1] : "EXACT"));
+            tables.add(Map.of("tableName", kv[0], "matchType", kv.length > 1 ? kv[1] : "EXACT",
+                    "ops", kv.length > 2 ? List.of(kv[2].split("\\|")) : ALL_OPS));
         }
         p.put("tables", tables);
         return p;
@@ -377,9 +384,9 @@ class PolicyDeciderDatabaseTest {
         assertEquals(PolicyDecider.Kind.ALLOW, kind(d, "SELECT", "appdb.order_a"));
     }
 
-    /** 无表 SHOW 例外: 没有表可命中, 取全部适用 DATA_SCOPE 的 topPriority 定档 */
+    /** 无表 SHOW 例外: 没有表可命中, 取 ops 含 SHOW 的那些 DATA_SCOPE 的 topPriority 定档 */
     @Test
-    void tablelessShowUsesAllApplicableScopes() {
+    void tablelessShowUsesOnlyScopesGrantingShow() {
         assertEquals(PolicyDecider.Kind.CONFIRM, kind(decider(scopeMode(1, "CONFIRM", "user")), "SHOW"));
     }
 
@@ -592,5 +599,107 @@ class PolicyDeciderDatabaseTest {
         w.put("priority", 20);
         String after = db(decider(w), "UPDATE", "appdb.t").policyRevision();
         assertNotEquals(before, after);
+    }
+
+    // ---------------- 表级操作授权 (设计文档 2026-10-09 §5 A4–A10) ----------------
+
+    /** A4–A7: orders 只读; log_ 前缀可读可删; JOIN 未授权表整体拒绝 */
+    @Test
+    void a4to7TableLevelOps() {
+        PolicyDecider d = decider(scope(1, "MYSQL", "orders:EXACT:SELECT", "users:EXACT:SELECT", "log_:PREFIX:SELECT|DELETE"));
+        assertEquals(PolicyDecider.Kind.ALLOW, kind(d, "SELECT", "appdb.orders"));
+        PolicyDecider.Decision del = db(d, "DELETE", "appdb.orders");
+        assertEquals(PolicyDecider.Kind.DENY, del.kind(), "表命中但 op 不在该表授权内");
+        assertEquals("超出数据范围, 已拒绝执行", del.reason());
+        assertEquals(PolicyDecider.Kind.ALLOW, kind(d, "DELETE", "appdb.log_2026"));
+        assertEquals(PolicyDecider.Kind.DENY, kind(d, "SELECT", "appdb.orders", "appdb.secret"));
+        // 一条语句碰多张表: 每张表都要允许该 op (log_ 允许 DELETE, orders 不允许)
+        assertEquals(PolicyDecider.Kind.DENY, kind(d, "DELETE", "appdb.log_a", "appdb.orders"));
+    }
+
+    /** A9 并集: 同表两条策略分别给 SELECT / DELETE, 两种 op 都放行; 都没给的仍拒 */
+    @Test
+    void a9OpsUnionAcrossPolicies() {
+        PolicyDecider d = decider(scope(1, "MYSQL", "orders:EXACT:SELECT"), scope(2, "MYSQL", "orders:EXACT:DELETE"));
+        assertEquals(PolicyDecider.Kind.ALLOW, kind(d, "SELECT", "appdb.orders"));
+        assertEquals(PolicyDecider.Kind.ALLOW, kind(d, "DELETE", "appdb.orders"));
+        assertEquals(PolicyDecider.Kind.DENY, kind(d, "UPDATE", "appdb.orders"));
+    }
+
+    /** A9 加法授权: 高优先级只给 SELECT 也收紧不了低优先级给的 DELETE; 档位只由允许该 op 的命中集决定 */
+    @Test
+    void a9PriorityDoesNotNarrowOps() {
+        Map<String, Object> high = scopeMode(1, "NONE", "orders:EXACT:SELECT");
+        high.put("priority", 10);
+        Map<String, Object> low = scopeMode(2, "APPROVAL", "orders:EXACT:DELETE");
+        low.put("priority", 90);
+        PolicyDecider d = decider(high, low);
+        assertEquals(PolicyDecider.Kind.ALLOW, kind(d, "SELECT", "appdb.orders"));
+        PolicyDecider.Decision r = db(d, "DELETE", "appdb.orders");
+        assertEquals(PolicyDecider.Kind.APPROVAL, r.kind());
+        assertEquals("p-2", r.policyLabel());
+    }
+
+    /** A9 同一策略内同表两条规则 (EXACT + PREFIX) 也取并集 */
+    @Test
+    void a9OpsUnionWithinPolicy() {
+        PolicyDecider d = decider(scope(1, "MYSQL", "orders:EXACT:SELECT", "ord:PREFIX:UPDATE"));
+        assertEquals(PolicyDecider.Kind.ALLOW, kind(d, "SELECT", "appdb.orders"));
+        assertEquals(PolicyDecider.Kind.ALLOW, kind(d, "UPDATE", "appdb.orders"));
+        assertEquals(PolicyDecider.Kind.DENY, kind(d, "DELETE", "appdb.orders"));
+    }
+
+    /** A9 小写 ops (存量/人工导入) 可解析且与大写同样命中; 裁决侧 op 大小写也不敏感 */
+    @Test
+    void a9LowercaseOps() {
+        PolicyDecider d = decider(scope(1, "MYSQL", "orders:EXACT:select|delete"));
+        assertEquals(PolicyDecider.Kind.ALLOW, kind(d, "SELECT", "appdb.orders"));
+        assertEquals(PolicyDecider.Kind.ALLOW, kind(d, "delete", "appdb.orders"));
+        assertEquals(PolicyDecider.Kind.DENY, kind(d, "UPDATE", "appdb.orders"));
+    }
+
+    /** A9 ops 缺失: 只有该策略降级为规则无效 (它适用的智能体被拒), 其它策略照常裁决, 快照照常加载 */
+    @Test
+    void a9MissingOpsOnlyInvalidatesThatPolicy() {
+        Map<String, Object> bad = base(2, PolicyStore.TYPE_DATA_SCOPE, "MYSQL", "NONE");
+        bad.put("agentIds", List.of(99));
+        bad.put("tables", List.of(Map.of("tableName", "orders", "matchType", "EXACT")));
+        PolicyDecider d = decider(scope(1, "MYSQL", "orders:EXACT:SELECT"), bad);
+        assertEquals(PolicyDecider.Kind.ALLOW, kind(d, "SELECT", "appdb.orders"));
+        PolicyDecider.Decision r = d.decideDatabase(99, "MYSQL", HOST, "SELECT", List.of("appdb.orders"), "appdb");
+        assertEquals(PolicyDecider.Kind.DENY, r.kind());
+        assertEquals("命中策略规则无效, 已按拒绝处理", r.reason());
+    }
+
+    /** A9 policyRevision 随 ops 变化; ops 下发顺序不同不影响 */
+    @Test
+    void a9RevisionTracksOps() {
+        String r1 = db(decider(scopeMode(1, "APPROVAL", "orders:EXACT:SELECT|DELETE")), "SELECT", "appdb.orders").policyRevision();
+        String r2 = db(decider(scopeMode(1, "APPROVAL", "orders:EXACT:SELECT")), "SELECT", "appdb.orders").policyRevision();
+        String r3 = db(decider(scopeMode(1, "APPROVAL", "orders:EXACT:DELETE|SELECT")), "SELECT", "appdb.orders").policyRevision();
+        assertNotNull(r1);
+        assertNotEquals(r1, r2, "改 ops 必须让在途审批失效");
+        assertEquals(r1, r3, "ops 顺序不同不该让在途审批失效");
+    }
+
+    /** A10 无表 SHOW: 仅授 SELECT 时拒; 任一表规则勾 SHOW 后放行 (粒度是全部无表 SHOW) */
+    @Test
+    void a10TablelessShowNeedsShowOp() {
+        PolicyDecider.Decision r = db(decider(scope(1, "MYSQL", "orders:EXACT:SELECT")), "SHOW");
+        assertEquals(PolicyDecider.Kind.DENY, r.kind());
+        assertEquals("超出数据范围, 已拒绝执行", r.reason());
+        assertEquals(PolicyDecider.Kind.ALLOW,
+                kind(decider(scope(1, "MYSQL", "orders:EXACT:SELECT", "log_:PREFIX:SHOW")), "SHOW"));
+        assertEquals(PolicyDecider.Kind.ALLOW,
+                kind(decider(scope(1, "MYSQL", "orders:EXACT:SELECT"), scope(2, "MYSQL", "x:EXACT:show")), "SHOW"));
+    }
+
+    /** A10 无表 SHOW 的返回集只取勾了 SHOW 的策略: 没勾 SHOW 的 APPROVAL 不参与抬档 */
+    @Test
+    void a10TablelessShowOnlyShowScopesSettle() {
+        PolicyDecider d = decider(scopeMode(1, "APPROVAL", "orders:EXACT:SELECT"), scopeMode(2, "CONFIRM", "orders:EXACT:SHOW"));
+        PolicyDecider.Decision r = db(d, "SHOW");
+        assertEquals(PolicyDecider.Kind.CONFIRM, r.kind());
+        assertEquals("p-2", r.policyLabel());
     }
 }

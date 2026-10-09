@@ -18,6 +18,7 @@ import java.util.ArrayList;
 import java.util.Comparator;
 import java.util.List;
 import java.util.Locale;
+import java.util.TreeSet;
 import java.util.regex.Pattern;
 
 /**
@@ -221,7 +222,8 @@ public class PolicyDecider {
      * 与 HOST 的差异只有两处:
      * <ul>
      *   <li>黑白名单谓词: op 与策略操作项 EXACT 相等 (大小写不敏感), 没有复合命令/显式路径那套降级</li>
-     *   <li>多一道 DATA_SCOPE: 与黑白名单是<b>与</b>的关系, 只能更严 —— 不通过直接 DENY, 不给确认/审批机会。
+     *   <li>多一道 DATA_SCOPE (表级操作授权: 每张表须命中一条允许该 op 的表规则, 多条命中取 ops 并集 —— 加法授权):
+     *       与黑白名单是<b>与</b>的关系, 只能更严 —— 不通过直接 DENY, 不给确认/审批机会。
      *       通过后, 实际命中表的 DATA_SCOPE (逐表先命中再按优先级收敛, 见 {@link #scopeHits}) 在档位上<b>当白名单侧</b>参与合并: 只配数据范围时由它们
      *       决定档位 (基调放行, CONFIRM/APPROVAL/BOTH 照常生效); 与白名单一起取最严; 黑名单拒判基调下同白名单,
      *       只能抬到 APPROVAL/BOTH, 救不回 NONE 的无条件拒绝。它们也进 matched, 标签与 policyRevision 都带上。
@@ -376,29 +378,46 @@ public class PolicyDecider {
     }
 
     /**
-     * DATA_SCOPE 判定: tables 非空且每张表都至少命中一条表规则 (任一 DATA_SCOPE 策略的规则都算, 与白名单
-     * anyHit 同口径, 不做交集). 不通过返回 null; 通过则返回参与档位合并的那几条策略
+     * DATA_SCOPE 判定: tables 非空且每张表都至少命中一条<b>允许该 op</b> 的表规则 (表名命中且规则 ops 含 op;
+     * 任一 DATA_SCOPE 策略的规则都算, 与白名单 anyHit 同口径, 不做交集). 不通过返回 null; 通过则返回参与档位合并的那几条策略
+     * <p>
+     * 加法授权: 同一张表命中多条规则时 ops 取并集 —— 任一命中规则含该 op 即通过. 优先级只在命中集内决定档位合并,
+     * 不能用来收紧某张表的操作 (高优先级规则只给 SELECT 也盖不掉低优先级规则给的 DELETE); 要收紧请配黑名单
      * <p>
      * 返回集与 HOST 同样是"先命中、再按优先级": 逐张表收集命中它的 DATA_SCOPE, 在这张表的命中集内取
      * topPriority, 再对所有表取并集 (去重保序)。不能直接对全部适用的 DATA_SCOPE 取 topPriority ——
      * 一条高优先级但没命中任何表的 NONE 会盖掉真正放行这张表的 APPROVAL, 审批被绕开; 同优先级没命中的
      * 也不该混进 matched 平白抬档或让 policyRevision 抖动
      * <p>
-     * 唯一例外是 op=SHOW 且 tables 为空 (SHOW TABLES / SHOW DATABASES 等): 只暴露名称不暴露数据, 放行
-     * (用户拍板); 没有表可命中, 返回集取全部适用 DATA_SCOPE 的 topPriority. 其余 tables 为空 (如
-     * {@code SELECT 1}, 或解析不完整) 一律不通过 —— fail-close, 解析不出表就当成"不知道碰了哪些表"
+     * 唯一例外是 op=SHOW 且 tables 为空 (SHOW TABLES / SHOW DATABASES / SHOW PROCESSLIST 等): 适用 DATA_SCOPE
+     * 中存在任一表规则的 ops 含 SHOW 才放行 (粒度是"任一表勾了 SHOW 即放行全部无表 SHOW"), 返回集取这些策略的
+     * topPriority; 没有任何表规则勾 SHOW 则拒绝 —— 只授 SELECT 的智能体不该能 SHOW PROCESSLIST.
+     * 其余 tables 为空 (如 {@code SELECT 1}, 或解析不完整) 一律不通过 —— fail-close, 解析不出表就当成"不知道碰了哪些表"
      */
     private static List<PolicyStore.Policy> scopeHits(List<PolicyStore.Policy> scopes, String dbType, String op,
                                                       List<String> tables, String defaultNamespace) {
+        String upperOp = op == null ? "" : op.toUpperCase(Locale.ROOT);
         if (tables == null || tables.isEmpty()) {
-            return "SHOW".equalsIgnoreCase(op) ? topPriority(scopes) : null;
+            if (!"SHOW".equals(upperOp)) {
+                return null;
+            }
+            List<PolicyStore.Policy> shows = new ArrayList<>();
+            for (PolicyStore.Policy p : scopes) {
+                for (PolicyStore.Table rule : p.tables()) {
+                    if (rule.ops().contains("SHOW")) {
+                        shows.add(p);
+                        break;
+                    }
+                }
+            }
+            return shows.isEmpty() ? null : topPriority(shows);
         }
         List<PolicyStore.Policy> out = new ArrayList<>();
         for (String table : tables) {
             List<PolicyStore.Policy> hits = new ArrayList<>();
             for (PolicyStore.Policy p : scopes) {
                 for (PolicyStore.Table rule : p.tables()) {
-                    if (tableHit(rule, dbType, table, defaultNamespace)) {
+                    if (rule.ops().contains(upperOp) && tableHit(rule, dbType, table, defaultNamespace)) {
                         hits.add(p);
                         break;
                     }
@@ -915,6 +934,10 @@ public class PolicyDecider {
                 for (PolicyStore.Table t : p.tables()) {
                     canonical.append("T:").append(t.matchType()).append(':').append(t.tableName().length())
                             .append(':').append(t.tableName()).append(';');
+                    // 表规则允许的操作也进摘要 (改 ops 使在途审批失效); 排序保证与下发顺序无关
+                    for (String o : new TreeSet<>(t.ops())) {
+                        canonical.append("O:").append(o.length()).append(':').append(o).append(';');
+                    }
                 }
             }
             canonical.append('\n');
