@@ -182,5 +182,82 @@ class PolicyStoreDatabaseTest {
         PolicyStore.Policy got = fetch(p).policies().get(0);
         assertFalse(got.database());
         assertEquals(List.of(), got.tables());
+        assertEquals("ALLOW", got.effect());
+    }
+
+    // ---------------- 数据范围允许/禁止动作 (设计文档 2026-10-10 §3.3 / §4 U6 U8) ----------------
+
+    /** U6 effect 缺失 (旧控制台) → ALLOW; 显式 ALLOW / DENY 原样接收 */
+    @Test
+    void effectMissingDefaultsToAllow() throws Exception {
+        Map<String, Object> p = dataScope(List.of(table("t1", "EXACT", List.of("DELETE"))));
+        PolicyStore.Policy got = fetch(p).policies().get(0);
+        assertFalse(got.rulesInvalid());
+        assertEquals("ALLOW", got.effect());
+        for (String e : List.of("ALLOW", "DENY")) {
+            p.put("effect", e);
+            got = fetch(p).policies().get(0);
+            assertFalse(got.rulesInvalid(), "effect=" + e);
+            assertEquals(e, got.effect());
+        }
+    }
+
+    /**
+     * U6/U8 effect 显式 null / 空串 / 大小写不符 / 未知值 / 数字 / 布尔 / 对象 → 该策略 rulesInvalid,
+     * 不整次拉取失败, 同快照其它策略照常有效
+     */
+    @Test
+    void effectInvalidDowngradesOnlyThatPolicy() throws Exception {
+        List<Object> bads = new ArrayList<>();
+        bads.add(null);
+        bads.add("");
+        bads.add("deny");
+        bads.add("X");
+        bads.add(5);
+        bads.add(true);
+        bads.add(Map.of("v", "DENY"));
+        for (Object e : bads) {
+            Map<String, Object> bad = dataScope(List.of(table("t1", "EXACT", List.of("DELETE"))));
+            bad.put("effect", e);
+            Map<String, Object> good = dataScope(List.of(table("t1", "EXACT", List.of("SELECT"))));
+            good.put("id", 2L);
+            good.put("effect", "DENY");
+            FakeConsoleClient console = new FakeConsoleClient();
+            console.data = Map.of("version", "v1", "policies", List.of(bad, good));
+            List<PolicyStore.Policy> got = new PolicyStore(console, new ObjectMapper()).fetch("v1").policies();
+            assertTrue(got.get(0).rulesInvalid(), "effect=" + e);
+            assertFalse(got.get(1).rulesInvalid(), "effect=" + e);
+            assertEquals("DENY", got.get(1).effect());
+        }
+    }
+
+    /** U8 DENY + tables=[] / 表名有空段 / 超过两段 (修复轮 1 P1-1) → rulesInvalid (DENY 下「永不命中」等于放行); ALLOW 同形态不收紧 */
+    @Test
+    void denyEffectEmptyOrBadSegmentTablesInvalid() throws Exception {
+        Map<String, Object> empty = dataScope(List.of());
+        empty.put("effect", "DENY");
+        assertTrue(fetch(empty).policies().get(0).rulesInvalid());
+        for (String name : List.of("sales.", ".x", "a..b", "a.b.c", "mydb.public.users")) {
+            Map<String, Object> p = dataScope(List.of(table("t1", "EXACT", List.of("DELETE")),
+                    table(name, "PREFIX", List.of("DELETE"))));
+            p.put("effect", "DENY");
+            assertTrue(fetch(p).policies().get(0).rulesInvalid(), "tableName=" + name);
+            p.put("effect", "ALLOW");
+            assertFalse(fetch(p).policies().get(0).rulesInvalid(), "ALLOW 不收紧: tableName=" + name);
+        }
+        Map<String, Object> ok = dataScope(List.of(table("sales.t1", "EXACT", List.of("DELETE"))));
+        ok.put("effect", "DENY");
+        assertFalse(fetch(ok).policies().get(0).rulesInvalid());
+    }
+
+    /** 非 DATA_SCOPE 不读 effect: 即使带了非法值也不影响 (黑白名单行为不变) */
+    @Test
+    void effectIgnoredForNonDataScope() throws Exception {
+        Map<String, Object> p = base(PolicyStore.TYPE_BLACKLIST, "MYSQL");
+        p.put("ops", List.of(Map.of("value", "DROP", "matchType", "EXACT")));
+        p.put("effect", "X");
+        PolicyStore.Policy got = fetch(p).policies().get(0);
+        assertFalse(got.rulesInvalid());
+        assertEquals("ALLOW", got.effect());
     }
 }

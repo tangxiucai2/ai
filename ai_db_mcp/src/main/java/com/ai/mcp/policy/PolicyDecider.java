@@ -229,6 +229,9 @@ public class PolicyDecider {
      *       只能抬到 APPROVAL/BOTH, 救不回 NONE 的无条件拒绝。它们也进 matched, 标签与 policyRevision 都带上。
      *       只配了 DATA_SCOPE、没有黑白名单时不落进"未命中任何白名单"的严格模式 (否则单配数据范围等于全封)</li>
      * </ul>
+     * 以上是 effect=ALLOW 的 DATA_SCOPE (允许范围). effect=DENY 的禁止范围 (设计文档 2026-10-10 §3.3) 不授权任何访问,
+     * 只在<b>拒绝侧</b>出现: 命中 (见 {@link #denyHits}) 即与黑名单命中集合并按 deny 基调 settle, 未命中不受影响;
+     * 黑白名单都未命中时仍是「未命中任何白名单」严格拒绝 —— 禁止范围不能把它放宽成可确认
      *
      * @param dbType           资源主类型 (MYSQL/POSTGRESQL/ORACLE/DAMENG…), 既是策略 hostType 口径, 也决定表名大小写规则
      * @param op               DBC 解析出的顶层操作 (十项之一)
@@ -257,31 +260,51 @@ public class PolicyDecider {
             // 与 HOST 同: 没有黑白名单/数据范围 (含只有限流) → 维持接入前的现状放行
             return Decision.of(Kind.ALLOW, null, null);
         }
-        List<PolicyStore.Policy> scopes = new ArrayList<>();
+        List<PolicyStore.Policy> allowScopes = new ArrayList<>();
+        List<PolicyStore.Policy> denyScopes = new ArrayList<>();
         List<PolicyStore.Policy> lists = new ArrayList<>();
         for (PolicyStore.Policy p : applicable) {
-            (PolicyStore.TYPE_DATA_SCOPE.equals(p.type()) ? scopes : lists).add(p);
-        }
-        // passed: 实际放行了这次访问的 DATA_SCOPE (先命中、再按优先级收敛), 并入白名单侧参与档位合并
-        List<PolicyStore.Policy> passed = List.of();
-        if (!scopes.isEmpty()) {
-            passed = scopeHits(scopes, dbType, op, tables, defaultNamespace);
-            if (passed == null) {
-                return Decision.of(Kind.DENY, "超出数据范围, 已拒绝执行", label(scopes));
+            if (!PolicyStore.TYPE_DATA_SCOPE.equals(p.type())) {
+                lists.add(p);
+            } else {
+                (PolicyStore.EFFECT_DENY.equals(p.effect()) ? denyScopes : allowScopes).add(p);
             }
         }
+        // passed: 实际放行了这次访问的允许范围 (先命中、再按优先级收敛), 并入白名单侧参与档位合并
+        List<PolicyStore.Policy> passed = List.of();
+        if (!allowScopes.isEmpty()) {
+            passed = scopeHits(allowScopes, dbType, op, tables, defaultNamespace);
+            if (passed == null) {
+                return Decision.of(Kind.DENY, "超出数据范围, 已拒绝执行", label(allowScopes));
+            }
+        }
+        // 禁止范围命中集 (逐表收敛后取并集), 与黑名单同在拒绝侧
+        List<PolicyStore.Policy> denyHits = denyHits(denyScopes, dbType, op, tables, defaultNamespace);
         if (lists.isEmpty()) {
-            return settle(List.of(), passed, "ALLOW", "在数据范围内");
+            if (!denyHits.isEmpty()) {
+                return settle(denyHits, passed, "DENY", "命中禁止范围");
+            }
+            // 只配禁止范围且未命中: 没有任何策略参与放行, 触发策略记 null (与「无策略放行」一致, 不写空串)
+            return passed.isEmpty()
+                    ? Decision.of(Kind.ALLOW, "在数据范围内", null)
+                    : settle(List.of(), passed, "ALLOW", "在数据范围内");
         }
         List<PolicyStore.Policy> deny = topPriority(matchOp(lists, PolicyStore.TYPE_BLACKLIST, op));
         List<PolicyStore.Policy> allow = topPriority(matchOp(lists, PolicyStore.TYPE_WHITELIST, op));
         if (deny.isEmpty() && allow.isEmpty()) {
-            // 数据范围只能更严, 不能替代白名单: 有黑白名单而 op 没被放行, 范围内也照拒
+            // 数据范围只能更严, 不能替代白名单: 有黑白名单而 op 没被放行, 范围内也照拒.
+            // 禁止范围命中也不改这个结论 —— 一条可确认的禁止范围会把严格拒绝放宽成可确认
             return Decision.of(Kind.DENY, "未命中任何白名单, 该智能体已配置访问控制策略", label(lists));
         }
         List<PolicyStore.Policy> allowSide = new ArrayList<>(allow);
         allowSide.addAll(passed);
-        return deny.isEmpty() ? settle(deny, allowSide, "ALLOW", "命中白名单") : settle(deny, allowSide, "DENY", "命中黑名单");
+        if (deny.isEmpty() && denyHits.isEmpty()) {
+            return settle(deny, allowSide, "ALLOW", "命中白名单");
+        }
+        // 拒绝侧 = 黑名单 (已按优先级收敛) ∪ 禁止范围命中; 两类之间不再互相收敛, 由 denyMode 取最严
+        List<PolicyStore.Policy> denySide = new ArrayList<>(deny);
+        denySide.addAll(denyHits);
+        return settle(denySide, allowSide, "DENY", deny.isEmpty() ? "命中禁止范围" : "命中黑名单");
     }
 
     /** 快照里属于某一类 (HOST / DATABASE) 的策略 */
@@ -414,15 +437,7 @@ public class PolicyDecider {
         }
         List<PolicyStore.Policy> out = new ArrayList<>();
         for (String table : tables) {
-            List<PolicyStore.Policy> hits = new ArrayList<>();
-            for (PolicyStore.Policy p : scopes) {
-                for (PolicyStore.Table rule : p.tables()) {
-                    if (rule.ops().contains(upperOp) && tableHit(rule, dbType, table, defaultNamespace)) {
-                        hits.add(p);
-                        break;
-                    }
-                }
-            }
+            List<PolicyStore.Policy> hits = tableOpHits(scopes, dbType, upperOp, table, defaultNamespace, false);
             if (hits.isEmpty()) {
                 return null;
             }
@@ -433,6 +448,52 @@ public class PolicyDecider {
             }
         }
         return out;
+    }
+
+    /**
+     * 禁止范围命中集: 对每张表找「表规则命中且该规则 ops 含本次 op」的禁止范围, 在这张表的命中集内取 topPriority,
+     * 再对所有表取并集 (去重保序) —— 与 {@link #scopeHits} 同样逐表收敛, 不做全局收敛: 否则 t1 上一条高优先级的
+     * CONFIRM 会盖掉 t2 上低优先级的 NONE, 把无条件拒绝放宽成可确认
+     * <p>
+     * 无表语句 (SELECT 1 / SHOW TABLES / 解析不出表) 一律不算命中: 禁止范围只管列出的表, 不复用允许侧的无表 SHOW 特例.
+     * 表规则匹配用 {@link #denyTableHit} (禁止侧宽匹配), 不是允许侧的 {@link #tableHit}
+     */
+    private static List<PolicyStore.Policy> denyHits(List<PolicyStore.Policy> denyScopes, String dbType, String op,
+                                                     List<String> tables, String defaultNamespace) {
+        List<PolicyStore.Policy> out = new ArrayList<>();
+        if (denyScopes.isEmpty() || tables == null) {
+            return out;
+        }
+        String upperOp = op == null ? "" : op.toUpperCase(Locale.ROOT);
+        for (String table : tables) {
+            for (PolicyStore.Policy p : topPriority(tableOpHits(denyScopes, dbType, upperOp, table, defaultNamespace, true))) {
+                if (!out.contains(p)) {
+                    out.add(p);
+                }
+            }
+        }
+        return out;
+    }
+
+    /**
+     * 某张表上「表规则命中且规则 ops 含 upperOp」的 DATA_SCOPE (未按优先级收敛)
+     *
+     * @param denySide 禁止侧用 {@link #denyTableHit} 宽匹配, 允许侧用 {@link #tableHit}
+     */
+    private static List<PolicyStore.Policy> tableOpHits(List<PolicyStore.Policy> scopes, String dbType, String upperOp,
+                                                        String table, String defaultNamespace, boolean denySide) {
+        List<PolicyStore.Policy> hits = new ArrayList<>();
+        for (PolicyStore.Policy p : scopes) {
+            for (PolicyStore.Table rule : p.tables()) {
+                if (rule.ops().contains(upperOp) && (denySide
+                        ? denyTableHit(rule, dbType, table, defaultNamespace)
+                        : tableHit(rule, dbType, table, defaultNamespace))) {
+                    hits.add(p);
+                    break;
+                }
+            }
+        }
+        return hits;
     }
 
     /**
@@ -456,6 +517,32 @@ public class PolicyDecider {
             case "EXACT" -> target[1].equals(want[1]);
             case "PREFIX" -> target[1].startsWith(want[1]);
             case "SUFFIX" -> target[1].endsWith(want[1]);
+            default -> false;
+        };
+    }
+
+    /**
+     * 禁止侧的表规则匹配: {@code 库.表} 规则同 {@link #tableHit} (命名空间精确比较); <b>裸表名规则</b>无论默认命名空间
+     * 是否存在, 一律只比目标的表名部分 (任意命名空间, 按 matchType, 大小写按库类型规范化) —— 即「只写表名时匹配所有库中的
+     * 同名表」. 禁止侧宽匹配宁可多拦: 照搬允许侧「裸名只代表默认命名空间」, 换个库名或连接无默认库就绕过禁止 (fail-open)
+     */
+    static boolean denyTableHit(PolicyStore.Table rule, String dbType, String table, String defaultNamespace) {
+        String want = foldCase(dbType, rule.tableName());
+        if (want == null || want.contains(".")) {
+            return tableHit(rule, dbType, table, defaultNamespace);
+        }
+        String target = foldCase(dbType, table);
+        if (target == null) {
+            return false;
+        }
+        String name = target.substring(target.indexOf('.') + 1);
+        if (want.isEmpty() || name.isEmpty()) {
+            return false;
+        }
+        return switch (rule.matchType()) {
+            case "EXACT" -> name.equals(want);
+            case "PREFIX" -> name.startsWith(want);
+            case "SUFFIX" -> name.endsWith(want);
             default -> false;
         };
     }
@@ -876,7 +963,7 @@ public class PolicyDecider {
     static String typeLabel(List<PolicyStore.Policy> policies) {
         List<String> types = new ArrayList<>();
         for (PolicyStore.Policy p : policies) {
-            String t = typeLabel(p.type());
+            String t = typeLabel(p);
             if (!types.contains(t)) {
                 types.add(t);
             }
@@ -884,7 +971,8 @@ public class PolicyDecider {
         return String.join(",", types);
     }
 
-    private static String typeLabel(String type) {
+    private static String typeLabel(PolicyStore.Policy p) {
+        String type = p.type();
         if (PolicyStore.TYPE_BLACKLIST.equals(type)) {
             return "操作黑名单";
         }
@@ -892,7 +980,7 @@ public class PolicyDecider {
             return "操作白名单";
         }
         if (PolicyStore.TYPE_DATA_SCOPE.equals(type)) {
-            return "数据范围限制";
+            return PolicyStore.EFFECT_DENY.equals(p.effect()) ? "数据范围禁止" : "数据范围限制";
         }
         return type;
     }
@@ -938,6 +1026,11 @@ public class PolicyDecider {
                     for (String o : new TreeSet<>(t.ops())) {
                         canonical.append("O:").append(o.length()).append(':').append(o).append(';');
                     }
+                }
+                // 动作只在 DENY 时追加: ALLOW (含旧控制台缺字段) 摘要逐字节不变, 在途审批单不失效;
+                // ALLOW↔DENY 切换语义正好相反, 必须让在途审批失效
+                if (PolicyStore.EFFECT_DENY.equals(p.effect())) {
+                    canonical.append("E:DENY;");
                 }
             }
             canonical.append('\n');

@@ -47,6 +47,10 @@ public class PolicyStore {
     /** 数据范围: 仅 DATABASE 类, 规则是逐表授权 (tables, 每张表带允许的 ops), 策略级 ops 恒空 */
     public static final String TYPE_DATA_SCOPE = "DATA_SCOPE";
 
+    /** DATA_SCOPE 动作: 允许 (加法授权, 缺字段时的默认) / 禁止 (命中即按黑名单处理); 值域严格大写, 仅 DATA_SCOPE 有意义 */
+    public static final String EFFECT_ALLOW = "ALLOW";
+    public static final String EFFECT_DENY = "DENY";
+
     /** HOST 类唯一的资源主类型; 其余 hostType 一律归 DATABASE 类 (控制台只下发这两类) */
     public static final String HOST_TYPE_SSH = "SSH";
 
@@ -120,12 +124,14 @@ public class PolicyStore {
      * @param priority        优先级 1~100, 数值越小越优先; 缺失字段折成 {@code 50}, 存在但非法直接 fetch() 失败.
      *                        同类型多条**命中**时只由优先级最高的那几条决定档位 (见 {@code PolicyDecider.topPriority})
      * @param tables          仅 DATA_SCOPE: 表规则; 其余类型恒为空列表
+     * @param effect          仅 DATA_SCOPE 有意义: {@link #EFFECT_ALLOW} / {@link #EFFECT_DENY}; 其余类型恒为 ALLOW.
+     *                        值非法时该策略已标 rulesInvalid, 此处记 DENY (不参与裁决, 只求不往宽处落)
      */
     public record Policy(long id, String name, String type, String hostType, List<Long> hostIds, List<Long> agentIds,
                          String approvalMode, boolean rulesInvalid, String rulesSummary, List<Op> ops,
                          long limit, long windowSeconds,
                          String actionTimeType, String actionTimeStart, String actionTimeEnd,
-                         int priority, List<Table> tables) {
+                         int priority, List<Table> tables, String effect) {
 
         /**
          * 是否 DATABASE 类: 按 hostType 静态归类 (与控制台 category() 同口径), 不看 type ——
@@ -335,6 +341,22 @@ public class PolicyStore {
                 invalid = true;
                 tables = List.of();
             }
+            String effect = EFFECT_ALLOW;
+            if (TYPE_DATA_SCOPE.equals(type)) {
+                effect = parseEffect(p);
+                if (effect == null) {
+                    // 只有「字段缺失」才折 ALLOW (旧控制台); 显式 null/空串/非文本/值域外都当规则无效 ——
+                    // 折成 ALLOW 会把一条禁止范围悄悄翻成允许, 语义正好相反. 同 ops 口径只降级这一条, 不牵连整次拉取
+                    log.warn("DATA_SCOPE effect 非法, 策略按规则无效处理 id={}", p.path("id").asLong());
+                    invalid = true;
+                    effect = EFFECT_DENY;
+                } else if (EFFECT_DENY.equals(effect) && !denyTablesValid(tables)) {
+                    // 禁止范围下「永不命中」等于放行: 空表规则、表名有空段 (sales. / .x / a..b, 裁决侧判为无法限定)、或超过两段 (库.表)
+                    // 都不能当普通未命中, 该策略降级为规则无效; 允许范围同形态不收紧 (存量照旧)
+                    log.warn("DATA_SCOPE 禁止范围表规则为空、表名有空段或超过两段(库.表), 策略按规则无效处理 id={}", p.path("id").asLong());
+                    invalid = true;
+                }
+            }
             // rulesSummary 展示用可空 (规则无效时控制台本就不下发有意义的摘要), 不必牵连整次拉取失败
             String rulesSummary = p.path("rulesSummary").isTextual() ? p.path("rulesSummary").asText() : null;
             // actionTimeStart/End 保留**原值**(可能为 null): 非法的那些已由 actionTimeValid 标成 invalid,
@@ -349,7 +371,7 @@ public class PolicyStore {
                     actionTimeType,
                     timeStartNode.isTextual() ? timeStartNode.asText() : null,
                     timeEndNode.isTextual() ? timeEndNode.asText() : null,
-                    priority, tables));
+                    priority, tables, effect));
         }
         return new Snapshot(versionNode.asText(), List.copyOf(policies));
     }
@@ -394,6 +416,42 @@ public class PolicyStore {
             tables.add(new Table(nameNode.asText(), matchTypeNode.asText(), ops));
         }
         return opsBad && !invalid ? null : List.copyOf(tables);
+    }
+
+    /** DATA_SCOPE 的 effect: 字段缺失 → ALLOW; 是 ALLOW/DENY 文本 → 原值; 其余 (含显式 null) 返回 null */
+    private static String parseEffect(JsonNode p) {
+        JsonNode node = p.path("effect");
+        if (node.isMissingNode()) {
+            return EFFECT_ALLOW;
+        }
+        if (node.isTextual() && (EFFECT_ALLOW.equals(node.asText()) || EFFECT_DENY.equals(node.asText()))) {
+            return node.asText();
+        }
+        return null;
+    }
+
+    /**
+     * 禁止范围的表规则: 非空, 且每个表名按 '.' 切分后没有空段、至多两段 ({@code 表} 或 {@code 库.表})
+     * <p>
+     * DBC 给网关的表一律是 {@code 命名空间.表} 两段 (多段名在 DBC 侧直接拒绝), 三段规则 ({@code a.b.c}) 永不命中 ——
+     * 禁止侧永不命中等于放行
+     */
+    private static boolean denyTablesValid(List<Table> tables) {
+        if (tables.isEmpty()) {
+            return false;
+        }
+        for (Table t : tables) {
+            String[] segs = t.tableName().split("\\.", -1);
+            if (segs.length > 2) {
+                return false;
+            }
+            for (String seg : segs) {
+                if (seg.isEmpty()) {
+                    return false;
+                }
+            }
+        }
+        return true;
     }
 
     /** 表规则允许的操作: 非空文本数组, 大写后均在 {@link #DB_OPS} 内; 不满足返回 null */

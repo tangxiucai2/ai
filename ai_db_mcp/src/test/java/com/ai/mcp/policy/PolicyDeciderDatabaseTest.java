@@ -702,4 +702,223 @@ class PolicyDeciderDatabaseTest {
         assertEquals(PolicyDecider.Kind.CONFIRM, r.kind());
         assertEquals("p-2", r.policyLabel());
     }
+
+    // ---------------- 数据范围允许/禁止动作 (设计文档 2026-10-10 §4 U1–U10) ----------------
+
+    /** effect=DENY 的 DATA_SCOPE (禁止范围): 规则写法同 {@link #scope}, 档位按 mode */
+    private static Map<String, Object> denyScope(long id, String mode, String... rules) {
+        Map<String, Object> p = scopeMode(id, mode, rules);
+        p.put("effect", "DENY");
+        return p;
+    }
+
+    /**
+     * U7 policyRevision: effect 缺失与显式 ALLOW 摘要相同, 且等于改动前金值; 同一策略 ALLOW↔DENY 摘要不同
+     * <p>
+     * 金值用改动前 (HEAD 025f8c1) 的 PolicyDecider.policyRevision 对同一条策略算出,
+     * 等于 sha256("1|DATA_SCOPE|APPROVAL|false|50|1|||T:EXACT:2:t1;O:6:DELETE;\n")
+     */
+    @Test
+    void u7RevisionEffect() {
+        String golden = "89e12c46261aa48396285329d3be9d6302780b149494ff0400689138156ccaa2";
+        String missing = db(decider(scopeMode(1, "APPROVAL", "t1:EXACT:DELETE")), "DELETE", "appdb.t1").policyRevision();
+        Map<String, Object> explicit = scopeMode(1, "APPROVAL", "t1:EXACT:DELETE");
+        explicit.put("effect", "ALLOW");
+        String allow = db(decider(explicit), "DELETE", "appdb.t1").policyRevision();
+        assertEquals(golden, missing);
+        assertEquals(golden, allow);
+        PolicyDecider.Decision deny = db(decider(denyScope(1, "APPROVAL", "t1:EXACT:DELETE")), "DELETE", "appdb.t1");
+        assertEquals(PolicyDecider.Kind.APPROVAL, deny.kind());
+        assertNotEquals(golden, deny.policyRevision(), "ALLOW↔DENY 必须让在途审批失效");
+    }
+
+    /** U1 只有禁止范围 t1:DELETE (NONE): DELETE t1 无条件拒; 其余 (别的 op / 别的表 / 无表) 不受影响 */
+    @Test
+    void u1DenyScopeOnly() {
+        PolicyDecider d = decider(denyScope(1, "NONE", "t1:EXACT:DELETE"));
+        PolicyDecider.Decision r = db(d, "DELETE", "appdb.t1");
+        assertEquals(PolicyDecider.Kind.DENY, r.kind());
+        assertEquals("命中禁止范围", r.reason());
+        assertEquals("p-1", r.policyLabel());
+        assertEquals(PolicyDecider.Kind.ALLOW, kind(d, "SELECT", "appdb.t1"));
+        assertEquals(PolicyDecider.Kind.ALLOW, kind(d, "DELETE", "appdb.t2"));
+        PolicyDecider.Decision miss = db(d, "SELECT");
+        assertEquals(PolicyDecider.Kind.ALLOW, miss.kind());
+        assertEquals(null, miss.policyLabel(), "未命中禁止范围的放行与「无策略放行」一致, 不写空串触发策略");
+        assertEquals(null, db(d, "DELETE", "appdb.t2").policyLabel());
+        // 一条语句碰多张表, 其中一张命中即拒
+        assertEquals(PolicyDecider.Kind.DENY, kind(d, "DELETE", "appdb.t2", "appdb.t1"));
+    }
+
+    /** U2 禁止范围档位 CONFIRM 命中 → CONFIRM; APPROVAL → APPROVAL, 类型标「数据范围禁止」 */
+    @Test
+    void u2DenyScopeModes() {
+        PolicyDecider.Decision c = db(decider(denyScope(1, "CONFIRM", "t1:EXACT:DELETE")), "DELETE", "appdb.t1");
+        assertEquals(PolicyDecider.Kind.CONFIRM, c.kind());
+        assertEquals("命中禁止范围", c.reason());
+        PolicyDecider.Decision a = db(decider(denyScope(1, "APPROVAL", "t1:EXACT:DELETE")), "DELETE", "appdb.t1");
+        assertEquals(PolicyDecider.Kind.APPROVAL, a.kind());
+        assertNotNull(a.policyRevision());
+        assertEquals("数据范围禁止", a.policyType());
+        assertEquals(PolicyDecider.Kind.BOTH,
+                kind(decider(denyScope(1, "BOTH", "t1:EXACT:DELETE")), "DELETE", "appdb.t1"));
+    }
+
+    /** U3 有黑名单 (禁 INSERT) + 禁止范围 CONFIRM 命中、无白名单 → 仍是「未命中任何白名单」严格拒绝, 不可确认 */
+    @Test
+    void u3BlacklistStrictModeNotRelaxedByDenyScope() {
+        PolicyDecider d = decider(bl(1, "NONE", "INSERT"), denyScope(2, "CONFIRM", "t1:EXACT:DELETE"));
+        PolicyDecider.Decision r = db(d, "DELETE", "appdb.t1");
+        assertEquals(PolicyDecider.Kind.DENY, r.kind());
+        assertEquals("未命中任何白名单, 该智能体已配置访问控制策略", r.reason());
+        assertEquals(PolicyDecider.Kind.DENY, kind(d, "SELECT", "appdb.t1"));
+    }
+
+    /** U4 白名单 DELETE + 禁止范围 t1:DELETE: DELETE t1 按禁止侧 settle; DELETE t2 命中白名单放行 */
+    @Test
+    void u4WhitelistWithDenyScope() {
+        PolicyDecider confirm = decider(wl(1, "NONE", "DELETE"), denyScope(2, "CONFIRM", "t1:EXACT:DELETE"));
+        PolicyDecider.Decision r = db(confirm, "DELETE", "appdb.t1");
+        assertEquals(PolicyDecider.Kind.CONFIRM, r.kind());
+        assertEquals("命中禁止范围", r.reason());
+        PolicyDecider.Decision ok = db(confirm, "DELETE", "appdb.t2");
+        assertEquals(PolicyDecider.Kind.ALLOW, ok.kind());
+        assertEquals("命中白名单", ok.reason());
+        PolicyDecider none = decider(wl(1, "NONE", "DELETE"), denyScope(2, "NONE", "t1:EXACT:DELETE"));
+        PolicyDecider.Decision n = db(none, "DELETE", "appdb.t1");
+        assertEquals(PolicyDecider.Kind.DENY, n.kind());
+        assertEquals("命中禁止范围", n.reason());
+        // 白名单 APPROVAL 只能把禁止侧 CONFIRM 抬到 APPROVAL (同黑名单口径)
+        assertEquals(PolicyDecider.Kind.APPROVAL,
+                kind(decider(wl(1, "APPROVAL", "DELETE"), denyScope(2, "CONFIRM", "t1:EXACT:DELETE")), "DELETE", "appdb.t1"));
+    }
+
+    /** U5 允许范围 t1:SELECT,DELETE + 禁止范围 t1:DELETE: SELECT t1 放行, DELETE t1 拒, SELECT t2 超出范围 */
+    @Test
+    void u5AllowAndDenyScopes() {
+        PolicyDecider d = decider(scope(1, "MYSQL", "t1:EXACT:SELECT|DELETE"), denyScope(2, "NONE", "t1:EXACT:DELETE"));
+        assertEquals(PolicyDecider.Kind.ALLOW, kind(d, "SELECT", "appdb.t1"));
+        PolicyDecider.Decision del = db(d, "DELETE", "appdb.t1");
+        assertEquals(PolicyDecider.Kind.DENY, del.kind());
+        assertEquals("命中禁止范围", del.reason());
+        PolicyDecider.Decision out = db(d, "SELECT", "appdb.t2");
+        assertEquals(PolicyDecider.Kind.DENY, out.kind());
+        assertEquals("超出数据范围, 已拒绝执行", out.reason());
+        // 禁止范围不进「超出数据范围」的标签 (它不授权任何访问)
+        assertEquals("p-1", out.policyLabel());
+    }
+
+    /** U6 快照 effect 缺失 → 按允许; 值非法 ("deny" / 数字) → 该策略规则无效拒绝, 快照照常加载 */
+    @Test
+    void u6EffectCompat() {
+        assertEquals(PolicyDecider.Kind.DENY, kind(decider(scope(1, "MYSQL", "t1:EXACT:SELECT")), "DELETE", "appdb.t1"),
+                "缺 effect 仍是允许语义: 未授权 op 超出范围");
+        for (Object bad : new Object[]{"deny", 5}) {
+            Map<String, Object> p = scope(1, "MYSQL", "t1:EXACT:DELETE");
+            p.put("effect", bad);
+            PolicyDecider.Decision r = db(decider(p), "SELECT", "appdb.t2");
+            assertEquals(PolicyDecider.Kind.DENY, r.kind(), "effect=" + bad);
+            assertEquals("命中策略规则无效, 已按拒绝处理", r.reason());
+        }
+    }
+
+    /** U8 禁止范围 + tables=[] 或空段表名 → 规则无效拒绝 (不能当「永不命中」放行) */
+    @Test
+    void u8DenyScopeEmptyOrBadTablesDenies() {
+        Map<String, Object> empty = denyScope(1, "NONE");
+        PolicyDecider.Decision r = db(decider(empty), "SELECT", "appdb.t1");
+        assertEquals(PolicyDecider.Kind.DENY, r.kind());
+        assertEquals("命中策略规则无效, 已按拒绝处理", r.reason());
+        PolicyDecider.Decision s = db(decider(denyScope(1, "NONE", "sales.:PREFIX:DELETE")), "SELECT", "appdb.t1");
+        assertEquals("命中策略规则无效, 已按拒绝处理", s.reason());
+        // 同样的空段表名在允许范围下照旧 (只是永不命中), 不收紧存量
+        assertEquals("超出数据范围, 已拒绝执行",
+                db(decider(scope(1, "MYSQL", "sales.:PREFIX")), "SELECT", "sales.x").reason());
+    }
+
+    /** U9 同表同 op 两条禁止范围 (p10 CONFIRM / p90 NONE) → 只认高优先级档 */
+    @Test
+    void u9DenyScopeTopPriority() {
+        Map<String, Object> high = denyScope(1, "CONFIRM", "t1:EXACT:DELETE");
+        high.put("priority", 10);
+        Map<String, Object> low = denyScope(2, "NONE", "t1:EXACT:DELETE");
+        low.put("priority", 90);
+        PolicyDecider.Decision r = db(decider(high, low), "DELETE", "appdb.t1");
+        assertEquals(PolicyDecider.Kind.CONFIRM, r.kind());
+        assertEquals("p-1", r.policyLabel());
+    }
+
+    /** U9 多表 t1/t2 各命中不同优先级的禁止范围 → 逐表收敛后取并集, 不再全局收敛 */
+    @Test
+    void u9DenyScopePerTableUnion() {
+        Map<String, Object> a = denyScope(1, "CONFIRM", "t1:EXACT:DELETE");
+        a.put("priority", 10);
+        Map<String, Object> b = denyScope(2, "NONE", "t2:EXACT:DELETE");
+        b.put("priority", 90);
+        PolicyDecider.Decision r = db(decider(a, b), "DELETE", "appdb.t1", "appdb.t2");
+        assertEquals(PolicyDecider.Kind.DENY, r.kind(), "全局收敛会只剩 p10 CONFIRM, 把 t2 的无条件拒绝放宽成可确认");
+        assertEquals("p-1,p-2", r.policyLabel());
+        // 未命中表的高优先级禁止范围不参与
+        assertEquals(PolicyDecider.Kind.DENY, kind(decider(a, b), "DELETE", "appdb.t2"));
+        assertEquals(PolicyDecider.Kind.CONFIRM, kind(decider(a, b), "DELETE", "appdb.t1"));
+    }
+
+    /** U9 黑名单 NONE + 禁止范围 CONFIRM 同命中 → DENY (不可确认), 原因以黑名单优先 */
+    @Test
+    void u9BlacklistNoneWithDenyScopeConfirm() {
+        PolicyDecider.Decision r = db(decider(bl(1, "NONE", "DELETE"), denyScope(2, "CONFIRM", "t1:EXACT:DELETE")),
+                "DELETE", "appdb.t1");
+        assertEquals(PolicyDecider.Kind.DENY, r.kind());
+        assertEquals("命中黑名单", r.reason());
+        assertEquals("p-1,p-2", r.policyLabel());
+    }
+
+    /** U10 只有禁止范围且勾了 SHOW: 无表 SHOW TABLES → 放行 (不复用允许侧的无表 SHOW 特例) */
+    @Test
+    void u10DenyScopeTablelessShowAllows() {
+        PolicyDecider d = decider(denyScope(1, "NONE", "t1:EXACT:SHOW|DELETE"));
+        assertEquals(PolicyDecider.Kind.ALLOW, kind(d, "SHOW"));
+        assertEquals(PolicyDecider.Kind.DENY, kind(d, "SHOW", "appdb.t1"));
+    }
+
+    /**
+     * 修复轮 1 P1-2 (裁定修订版): 裸表名禁止规则无论默认命名空间是否存在, 都按表名部分宽匹配任意命名空间;
+     * {@code 库.表} 禁止规则仍按命名空间精确比较; 允许侧照旧 (裸名只代表默认命名空间, 缺默认库不命中)
+     */
+    @Test
+    void denyBareRuleWithoutDefaultNamespaceMatchesAnyNamespace() {
+        PolicyDecider deny = decider(denyScope(1, "NONE", "test1024:EXACT:DELETE"));
+        PolicyDecider.Decision r = deny.decideDatabase(AGENT, "MYSQL", HOST, "DELETE", List.of("soag.test1024"), null);
+        assertEquals(PolicyDecider.Kind.DENY, r.kind());
+        assertEquals("命中禁止范围", r.reason());
+        assertEquals(PolicyDecider.Kind.ALLOW,
+                deny.decideDatabase(AGENT, "MYSQL", HOST, "DELETE", List.of("soag.test10245"), null).kind());
+        assertEquals(PolicyDecider.Kind.ALLOW,
+                deny.decideDatabase(AGENT, "MYSQL", HOST, "SELECT", List.of("soag.test1024"), null).kind());
+        // PREFIX / SUFFIX 同样只作用于表名部分; 大小写按库类型规范化
+        PolicyDecider prefix = decider(denyScope(1, "NONE", "log_:PREFIX:DELETE"));
+        assertEquals(PolicyDecider.Kind.DENY,
+                prefix.decideDatabase(AGENT, "MYSQL", HOST, "DELETE", List.of("any.log_2026"), null).kind());
+        Map<String, Object> ora = denyScope(1, "NONE", "emp:SUFFIX:DELETE");
+        ora.put("hostType", "ORACLE");
+        assertEquals(PolicyDecider.Kind.DENY,
+                decider(ora).decideDatabase(AGENT, "ORACLE", HOST, "DELETE", List.of("HR.T_EMP"), null).kind());
+        // 有默认命名空间时裸名禁止规则同样匹配其它库的同名表
+        assertEquals(PolicyDecider.Kind.DENY,
+                deny.decideDatabase(AGENT, "MYSQL", HOST, "DELETE", List.of("other.test1024"), "soag").kind());
+        // 带库名的禁止规则按命名空间精确比较
+        PolicyDecider qualified = decider(denyScope(1, "NONE", "soag.test1024:EXACT:DELETE"));
+        assertEquals(PolicyDecider.Kind.ALLOW,
+                qualified.decideDatabase(AGENT, "MYSQL", HOST, "DELETE", List.of("other.test1024"), "soag").kind());
+        assertEquals(PolicyDecider.Kind.DENY,
+                qualified.decideDatabase(AGENT, "MYSQL", HOST, "DELETE", List.of("soag.test1024"), "other").kind());
+        // 允许侧有默认库时裸名仍只代表默认库
+        assertEquals("超出数据范围, 已拒绝执行", decider(scope(1, "MYSQL", "test1024:EXACT:DELETE"))
+                .decideDatabase(AGENT, "MYSQL", HOST, "DELETE", List.of("other.test1024"), "soag").reason());
+        // 允许侧同场景照旧不命中
+        PolicyDecider.Decision a = decider(scope(1, "MYSQL", "test1024:EXACT:DELETE"))
+                .decideDatabase(AGENT, "MYSQL", HOST, "DELETE", List.of("soag.test1024"), null);
+        assertEquals(PolicyDecider.Kind.DENY, a.kind());
+        assertEquals("超出数据范围, 已拒绝执行", a.reason());
+    }
 }
